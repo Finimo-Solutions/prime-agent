@@ -14,6 +14,7 @@ const daemonClientMock = vi.hoisted(() => {
 		schedule?: string;
 		prompt?: string;
 		includeInactive?: boolean;
+		includeClientOwned?: boolean;
 		all?: boolean;
 		sessionPath?: string;
 		config?: {
@@ -31,6 +32,7 @@ const daemonClientMock = vi.hoisted(() => {
 		emitStaleAgentEndOnAttach: false,
 		connectFails: false,
 		sessions: [] as Array<Record<string, unknown>>,
+		busyClientOwnedSessionCount: 0,
 	};
 
 	class MockDaemonClient {
@@ -51,7 +53,16 @@ const daemonClientMock = vi.hoisted(() => {
 		async request(command: Command): Promise<Response> {
 			this.requests.push(command);
 			if (command.type === "list") {
-				return { type: "response", command: command.type, success: true, data: { sessions: behavior.sessions } };
+				// The supervisor only returns the tally when it is asked for, so a
+				// caller that does not set includeClientOwned cannot see it.
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: command.includeClientOwned
+						? { sessions: behavior.sessions, busyClientOwnedSessionCount: behavior.busyClientOwnedSessionCount }
+						: { sessions: behavior.sessions },
+				};
 			}
 			if (command.type === "attach" && behavior.emitStaleAgentEndOnAttach) {
 				this.emitMessage({ type: "session_event", activeSessionId: "active-1", event: { type: "agent_end" } });
@@ -138,6 +149,7 @@ describe("daemon command", () => {
 		daemonClientMock.behavior.emitStaleAgentEndOnAttach = false;
 		daemonClientMock.behavior.connectFails = false;
 		daemonClientMock.behavior.sessions = [];
+		daemonClientMock.behavior.busyClientOwnedSessionCount = 0;
 		consoleErrorMessages = [];
 		vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null | undefined) => {
 			throw new Error(`exit ${code}`);
@@ -218,6 +230,41 @@ describe("daemon command", () => {
 		await expect(command).resolves.toBe(true);
 		expect(client?.messageListenerCountAtClose).toBe(0);
 		expect(client?.closeListenerCountAtClose).toBe(0);
+	});
+
+	it("reports busy client-owned sessions instead of denying any agent is running", async () => {
+		// Regression: `list` printed a bare "No active agents." while the daemon
+		// was holding busy workers owned by another client. The workers stay
+		// unlisted (cross-client isolation is deliberate) but the operator must
+		// not be told nothing is running.
+		daemonClientMock.behavior.sessions = [];
+		daemonClientMock.behavior.busyClientOwnedSessionCount = 2;
+		const logged: unknown[] = [];
+		vi.spyOn(console, "log").mockImplementation((...messages: unknown[]) => {
+			logged.push(...messages);
+		});
+
+		await expect(handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "list"])).resolves.toBe(true);
+
+		const client = daemonClientMock.instances[0];
+		expect(client?.requests[0]).toMatchObject({ type: "list", includeClientOwned: true });
+		const output = logged.filter((m): m is string => typeof m === "string").join("\n");
+		expect(output).toContain("2 busy sessions owned by another client");
+	});
+
+	it("still reports nothing running when the daemon holds no client-owned sessions", async () => {
+		daemonClientMock.behavior.sessions = [];
+		daemonClientMock.behavior.busyClientOwnedSessionCount = 0;
+		const logged: unknown[] = [];
+		vi.spyOn(console, "log").mockImplementation((...messages: unknown[]) => {
+			logged.push(...messages);
+		});
+
+		await expect(handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "list"])).resolves.toBe(true);
+
+		const output = logged.filter((m): m is string => typeof m === "string").join("\n");
+		expect(output).toContain("No active agents.");
+		expect(output).not.toContain("owned by another client");
 	});
 
 	it("chooses a terminating non-colliding default name past the safe-integer range", async () => {
