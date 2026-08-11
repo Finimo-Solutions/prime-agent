@@ -1,5 +1,5 @@
 // TODO: reconsider persistent kernel vs stateless `python -c` once RLM-1 weights land.
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -39,6 +39,19 @@ const SNAPSHOT_MAX_OUTPUT_CHARS = 1_000_000;
 // on-disk copy is the fallback if this is exceeded.
 const SNAPSHOT_DISPOSE_TIMEOUT_MS = 5000;
 const KERNEL_ABORT_GRACE_MS = 1000;
+/**
+ * Wall-clock bound on a single execute. Without one, a cell that spawns a child
+ * blocked on stdin never replies and the agent waits forever, silently: the
+ * kernel waits on the child, the agent waits on the kernel, and nothing
+ * surfaces. MEASURED: a bash child with fd 0 on an empty pipe wedged a run
+ * permanently, and killing that child by hand did not resume it.
+ *
+ * Generous by design — this is a stuck-forever backstop, not a performance
+ * budget. Builds and test suites legitimately run for many minutes.
+ */
+const DEFAULT_EXECUTE_TIMEOUT_MS = 15 * 60 * 1000;
+/** After the timeout interrupt, how long to wait before killing the children. */
+const KERNEL_TIMEOUT_KILL_GRACE_MS = 5000;
 const KERNEL_BUSY_REUSE_WAIT_MS = 5000;
 const KERNEL_BUSY_INTERRUPT_INTERVAL_MS = 500;
 const MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS = 256;
@@ -104,6 +117,12 @@ export interface ExecuteOptions {
 	maxOutputChars?: number;
 	/** Synthetic host cell (snapshot/restore/list); excluded from lastCellCode attribution. */
 	internal?: boolean;
+	/**
+	 * Wall-clock bound in ms. Defaults to DEFAULT_EXECUTE_TIMEOUT_MS; 0 or a
+	 * negative value disables the bound (the pre-existing hang-forever
+	 * behaviour, kept reachable for callers that genuinely want it).
+	 */
+	timeoutMs?: number;
 }
 
 /** MIME tag the `edit` skill emits diff payloads under, via `display_data`. */
@@ -164,7 +183,8 @@ export interface ExecuteResult {
 	attachments?: KernelAttachment[];
 	/** Agent messages sent from this cell, in order. */
 	sentAgentMessages?: KernelSentAgentMessage[];
-	status: "ok" | "error" | "aborted";
+	/** `timeout`: exceeded the wall-clock bound and its children were killed. */
+	status: "ok" | "error" | "aborted" | "timeout";
 	error?: { ename: string; evalue: string; traceback: string[] };
 	durationMs: number;
 }
@@ -317,6 +337,14 @@ interface ActiveExecution {
 	sentAgentMessages: KernelSentAgentMessage[];
 	error?: ExecuteResult["error"];
 	status: ExecuteResult["status"];
+	/**
+	 * We tripped the wall-clock bound on this cell. Recorded separately from
+	 * `status` because the interrupt often DOES land, and the kernel then
+	 * replies with an ordinary KeyboardInterrupt traceback — which reads as a
+	 * plain error and tells the model nothing about why its cell was killed.
+	 * The reason the cell ended is ours to report, not the kernel's.
+	 */
+	timedOut?: boolean;
 	settled: boolean;
 	resolve: (result: ExecuteResult) => void;
 	reject: (error: Error) => void;
@@ -911,8 +939,60 @@ export class KernelManager {
 			}
 		};
 
+		// Wall-clock backstop. Two stages, because an interrupt alone is not
+		// enough: SIGINT reaches the kernel, but a child already blocked on stdin
+		// keeps the kernel blocked, so the reply never comes. Stage 2 kills the
+		// children and settles the execution REGARDLESS, so the model always gets
+		// a result it can act on instead of waiting forever.
+		const timeoutMs = opts.timeoutMs ?? DEFAULT_EXECUTE_TIMEOUT_MS;
+		let timeoutTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
+		let timeoutKillTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
+		const clearTimeoutTimers = () => {
+			if (timeoutTimer) {
+				globalThis.clearTimeout(timeoutTimer);
+				timeoutTimer = undefined;
+			}
+			if (timeoutKillTimer) {
+				globalThis.clearTimeout(timeoutKillTimer);
+				timeoutKillTimer = undefined;
+			}
+		};
+		const unrefTimer = (timer: ReturnType<typeof globalThis.setTimeout> | undefined) => {
+			if (timer && typeof timer === "object" && "unref" in timer) {
+				timer.unref();
+			}
+		};
+		const onTimeout = () => {
+			if (this.activeExecution !== execution || execution.settled) {
+				return;
+			}
+			execution.timedOut = true;
+			// Surface it. A silent timeout is the same observability failure as the
+			// silent hang it replaces.
+			const seconds = Math.round(timeoutMs / 1000);
+			opts.onStream?.(`\n[kernel] execution exceeded ${seconds}s — interrupting\n`, "stderr");
+			void this.interrupt().catch(() => undefined);
+			timeoutKillTimer = globalThis.setTimeout(() => {
+				if (this.activeExecution !== execution || execution.settled) {
+					return;
+				}
+				const killed = this.terminateKernelChildren();
+				opts.onStream?.(
+					`[kernel] still blocked after interrupt — killed ${killed} child process(es); returning timeout\n`,
+					"stderr",
+				);
+				execution.status = "timeout";
+				this.resolveExecution(execution, { clearActive: false });
+			}, KERNEL_TIMEOUT_KILL_GRACE_MS);
+			unrefTimer(timeoutKillTimer);
+		};
+
 		try {
 			this.activeExecution = execution;
+			if (timeoutMs > 0) {
+				timeoutTimer = globalThis.setTimeout(onTimeout, timeoutMs);
+				unrefTimer(timeoutTimer);
+			}
 			opts.signal?.addEventListener("abort", onAbort, { once: true });
 			if (opts.signal?.aborted) {
 				onAbort();
@@ -936,8 +1016,46 @@ export class KernelManager {
 			return await result.promise;
 		} finally {
 			clearAbortTimer();
+			clearTimeoutTimers();
 			opts.signal?.removeEventListener("abort", onAbort);
 		}
+	}
+
+	/**
+	 * Kill the kernel's child processes, leaving the kernel itself alive so the
+	 * session's state survives. Children are ENUMERATED via `ps -o pid= -ppid`,
+	 * never matched by pattern: a pattern kill on a shared machine can reap an
+	 * unrelated process that merely looks similar. Returns how many were killed.
+	 */
+	private terminateKernelChildren(): number {
+		const pid = this.kernelPid ?? this.kernel?.pid;
+		if (pid === undefined) {
+			return 0;
+		}
+		let out: string;
+		try {
+			out = execFileSync("ps", ["-o", "pid=", "-ppid", String(pid)], {
+				encoding: "utf8",
+				timeout: 5000,
+			});
+		} catch {
+			// No children, or `ps` unavailable (exit 1 when the list is empty).
+			return 0;
+		}
+		let killed = 0;
+		for (const line of out.split("\n")) {
+			const childPid = Number.parseInt(line.trim(), 10);
+			if (!Number.isInteger(childPid) || childPid <= 0) {
+				continue;
+			}
+			try {
+				process.kill(childPid, "SIGKILL");
+				killed += 1;
+			} catch {
+				// Already gone.
+			}
+		}
+		return killed;
 	}
 
 	private startIopubPump(): void {
@@ -1063,7 +1181,9 @@ export class KernelManager {
 			let stdout = execution.stdout;
 			let stderr = execution.stderr;
 			let result = execution.result;
-			let status = execution.status;
+			// A cell we timed out is reported as a timeout even when the interrupt
+			// landed and the kernel replied with a KeyboardInterrupt error.
+			let status = execution.timedOut ? "timeout" : execution.status;
 			if (execution.stdoutTruncated) stdout += `\n[... output truncated at ${execution.maxChars} chars ...]`;
 			if (execution.stderrTruncated) stderr += `\n[... output truncated at ${execution.maxChars} chars ...]`;
 			if (result !== undefined && result.length > execution.maxChars) {

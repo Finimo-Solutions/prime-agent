@@ -160,6 +160,13 @@ const KERNEL_RESTART_NOTICE = [
 	"</ipython_kernel_reset>",
 ].join("\n");
 
+const KERNEL_TIMEOUT_NOTICE = [
+	"<ipython_execution_timeout>",
+	"This cell exceeded the execution time limit and was stopped; any child processes it started were killed. The usual cause is a command that waits on input that never arrives — an interactive prompt, or a process reading stdin. Re-running it unchanged will time out again.",
+	"Redirect stdin (`< /dev/null`) or pass a non-interactive flag, and bound anything that can wait. Note that `< /dev/null` on a heredoc replaces the heredoc's own stdin, so apply it to the command, not the heredoc.",
+	"</ipython_execution_timeout>",
+].join("\n");
+
 function createAbortError(): Error {
 	return new Error("IPython execution aborted");
 }
@@ -247,7 +254,7 @@ export type IpythonToolInput = Static<typeof ipythonSchema>;
 
 export interface IpythonToolDetails {
 	durationMs?: number;
-	status?: "ok" | "error" | "aborted" | "starting";
+	status?: "ok" | "error" | "aborted" | "timeout" | "starting";
 	errorEname?: string;
 	stdout?: string;
 	stderr?: string;
@@ -670,6 +677,11 @@ export function createIpythonToolDefinition(
 				if (r.status === "error" && r.error) {
 					text += (text ? "\n" : "") + r.error.traceback.join("\n");
 				}
+				if (r.status === "timeout") {
+					// Say what happened and what to do about it. A timeout the model
+					// cannot interpret is a hang it merely learns about later.
+					text += (text ? "\n" : "") + KERNEL_TIMEOUT_NOTICE;
+				}
 				if (kernelRestarted) {
 					text = text ? `${KERNEL_RESTART_NOTICE}\n\n${text}` : KERNEL_RESTART_NOTICE;
 				}
@@ -692,7 +704,7 @@ export function createIpythonToolDefinition(
 						kernelRestarted,
 						error: r.error,
 					},
-					isError: r.status === "error" || r.status === "aborted",
+					isError: r.status === "error" || r.status === "aborted" || r.status === "timeout",
 				};
 			} finally {
 				if (hasWorkingMessage) {
