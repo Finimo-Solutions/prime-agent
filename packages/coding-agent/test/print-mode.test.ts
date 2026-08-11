@@ -148,6 +148,72 @@ describe("runPrintMode", () => {
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
 	});
 
+	it("streams tool-call boundaries to stderr while the run is in flight", async () => {
+		// Regression: print mode wrote NOTHING until completion, so a run doing
+		// real work and a run wedged forever produced identical output — nothing.
+		// MEASURED: 0 bytes for 25 minutes while the agent worked.
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "done" }));
+		const { session } = runtimeHost;
+		let emitSessionEvent: ((event: unknown) => void) | undefined;
+		session.subscribe.mockImplementation((listener: (event: unknown) => void) => {
+			emitSessionEvent = listener;
+			return () => {};
+		});
+		const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		// `output` is hoisted and shared across this file's tests, so it carries
+		// writes from earlier ones.
+		output.write.mockClear();
+		session.promptAndWait.mockImplementation(async () => {
+			emitSessionEvent?.({ type: "tool_execution_start", toolCallId: "t1", toolName: "ipython", args: {} });
+			emitSessionEvent?.({
+				type: "tool_execution_end",
+				toolCallId: "t1",
+				toolName: "ipython",
+				result: {},
+				isError: false,
+			});
+		});
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+			initialMessage: "go",
+		});
+
+		expect(exitCode).toBe(0);
+		const stderrText = stderrWrite.mock.calls.map((call) => String(call[0])).join("");
+		expect(stderrText).toContain("→ ipython");
+		expect(stderrText).toContain("← ipython");
+		// stdout stays the result channel, so pipelines are unaffected.
+		const stdoutText = output.write.mock.calls.map((call) => String(call[0])).join("");
+		expect(stdoutText).toBe("done\n");
+	});
+
+	it("leaves json mode output untouched and writes no progress to stderr", async () => {
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "done" }));
+		const { session } = runtimeHost;
+		let emitSessionEvent: ((event: unknown) => void) | undefined;
+		session.subscribe.mockImplementation((listener: (event: unknown) => void) => {
+			emitSessionEvent = listener;
+			return () => {};
+		});
+		const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		output.write.mockClear();
+		session.promptAndWait.mockImplementation(async () => {
+			emitSessionEvent?.({ type: "tool_execution_start", toolCallId: "t1", toolName: "ipython", args: {} });
+		});
+
+		await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "json",
+			initialMessage: "go",
+		});
+
+		const stderrText = stderrWrite.mock.calls.map((call) => String(call[0])).join("");
+		expect(stderrText).not.toContain("ipython");
+		// The event still reaches stdout as JSON, exactly as before.
+		const stdoutText = output.write.mock.calls.map((call) => String(call[0])).join("");
+		expect(stdoutText).toContain('"tool_execution_start"');
+	});
+
 	it("disposes the connection before exiting on SIGINT", async () => {
 		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "done" }));
 		const { session } = runtimeHost;
