@@ -744,7 +744,11 @@ async function canConnectToDaemon(socketPath: string, timeoutMs: number): Promis
 
 async function runList(client: DaemonClient, args: string[], json: boolean): Promise<void> {
 	const { all } = parseListArgs(args);
-	const response = await client.request({ type: "list", all });
+	// Ask for the client-owned tally too. Workers owned by ANOTHER client stay
+	// unlisted — `isWorkerAccessibleToClient` is deliberate isolation — but the
+	// supervisor already counts them, and reporting "No active agents" while it
+	// knows sessions are running is the one answer that is simply false.
+	const response = await client.request({ type: "list", all, includeClientOwned: true });
 	const data = requireSuccess(response);
 	if (json) {
 		printJson(data);
@@ -758,6 +762,15 @@ async function runList(client: DaemonClient, args: string[], json: boolean): Pro
 	}
 
 	if (sessions.length === 0) {
+		const busyClientOwned = getBusyClientOwnedSessionCount(data);
+		if (busyClientOwned > 0) {
+			const plural = busyClientOwned === 1 ? "session" : "sessions";
+			console.log(
+				`${all ? "No agents." : "No active agents."} ` +
+					`(${busyClientOwned} busy ${plural} owned by another client — not listed here.)`,
+			);
+			return;
+		}
 		console.log(all ? "No agents." : "No active agents.");
 		return;
 	}
@@ -1625,6 +1638,15 @@ function getSessionSummaries(value: unknown): SessionSummary[] | undefined {
 		return undefined;
 	}
 	return entries;
+}
+
+/** Busy sessions the daemon holds for other clients. Absent unless asked for. */
+function getBusyClientOwnedSessionCount(value: unknown): number {
+	if (!value || typeof value !== "object") {
+		return 0;
+	}
+	const count = (value as { busyClientOwnedSessionCount?: unknown }).busyClientOwnedSessionCount;
+	return typeof count === "number" && Number.isFinite(count) && count > 0 ? count : 0;
 }
 
 function isSessionSummary(value: unknown): value is SessionSummary {
