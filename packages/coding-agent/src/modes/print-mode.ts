@@ -6,6 +6,8 @@
  * - `pi --mode json "prompt"` - JSON event stream
  */
 
+import { closeSync, mkdirSync, openSync, writeSync } from "node:fs";
+import { dirname } from "node:path";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.js";
 import { type AgentAutonomousStatus, type AutonomousLimitReason, autonomousLimitReason } from "../core/autonomous.js";
@@ -27,6 +29,72 @@ export interface PrintModeOptions {
 	initialMessage?: string;
 	/** Images to attach to the initial message */
 	initialImages?: ImageContent[];
+	/** Append every session event to this path as NDJSON. See openEventLog. */
+	eventsPath?: string;
+}
+
+/**
+ * Append the session event stream to a file as NDJSON, one event per line.
+ *
+ * WHY, when `--mode json` already emits these events. It emits them to STDOUT,
+ * which in print mode is the RESULT channel. So a caller can have the result or
+ * the trace, never both — and anything that wants to grade the answer *and*
+ * audit how it was reached has to pick one. This is a third channel that costs
+ * the other two nothing and works in every mode.
+ *
+ * WHY A FILE AND NOT A PIPE. The event that most needs recording is the one
+ * immediately before a run dies. A pipe consumer that is itself killed loses the
+ * history; a file does not. Each line lands as it happens, so a killed, wedged
+ * or OOM-ed run still leaves a complete record up to the moment it stopped, and
+ * "hung after step 12" becomes readable instead of inferred from an empty log.
+ *
+ * WHY NDJSON. Append-only and parseable line by line, so a partial file from an
+ * interrupted run is still valid input. A single JSON array would have to be
+ * closed to be readable — exactly the property you lose in the case you care
+ * about.
+ *
+ * WHY writeSync. The point is that the line is on disk before the next step
+ * runs, not queued in a buffer that a SIGKILL discards.
+ *
+ * Failing to open the log is reported once on stderr and is NOT fatal: an
+ * unwritable audit path must not kill an otherwise healthy run.
+ */
+function openEventLog(eventsPath: string | undefined): {
+	write: (event: unknown) => void;
+	close: () => void;
+} {
+	if (!eventsPath) {
+		return { write: () => {}, close: () => {} };
+	}
+	let fd: number | undefined;
+	try {
+		mkdirSync(dirname(eventsPath), { recursive: true });
+		fd = openSync(eventsPath, "a");
+	} catch (error) {
+		process.stderr.write(`[events] cannot open ${eventsPath}: ${String(error)}\n`);
+		return { write: () => {}, close: () => {} };
+	}
+	let broken = false;
+	return {
+		write: (event: unknown) => {
+			if (broken || fd === undefined) return;
+			try {
+				writeSync(fd, `${JSON.stringify(event)}\n`);
+			} catch (error) {
+				broken = true;
+				process.stderr.write(`[events] write failed, log truncated: ${String(error)}\n`);
+			}
+		},
+		close: () => {
+			if (fd === undefined) return;
+			try {
+				closeSync(fd);
+			} catch {
+				// Nothing useful to do here; the run's result matters more.
+			}
+			fd = undefined;
+		},
+	};
 }
 
 /**
@@ -103,7 +171,8 @@ async function runPrintModeWithConnectionInternal(
 	options: PrintModeOptions,
 	bindHeadlessExtensions?: () => Promise<void>,
 ): Promise<number> {
-	const { mode, messages = [], initialMessage, initialImages } = options;
+	const { mode, messages = [], initialMessage, initialImages, eventsPath } = options;
+	const eventLog = openEventLog(eventsPath);
 	let exitCode = 0;
 	let disposed = false;
 	let unsubscribe: (() => void) | undefined;
@@ -133,15 +202,21 @@ async function runPrintModeWithConnectionInternal(
 	}
 
 	try {
-		if (mode === "json") {
-			const header = await connection.getSessionHeader();
-			if (header) {
-				writeRawStdout(`${JSON.stringify(header)}\n`);
-			}
+		const header = mode === "json" || eventsPath ? await connection.getSessionHeader() : undefined;
+		if (mode === "json" && header) {
+			writeRawStdout(`${JSON.stringify(header)}\n`);
+		}
+		// The header names the model and session; without it the trace cannot be
+		// attributed to a build, which is half the value of keeping it.
+		if (header) {
+			eventLog.write(header);
 		}
 
 		const toolStartedAt = new Map<string, number>();
 		unsubscribe = connection.subscribe((event) => {
+			if (event.type === "session_event") {
+				eventLog.write(event.event);
+			}
 			if (mode === "json" && event.type === "session_event") {
 				writeRawStdout(`${JSON.stringify(event.event)}\n`);
 			}
@@ -206,6 +281,7 @@ async function runPrintModeWithConnectionInternal(
 		console.error(error instanceof Error ? error.message : String(error));
 		return 1;
 	} finally {
+		eventLog.close();
 		for (const cleanup of signalCleanupHandlers) {
 			cleanup();
 		}

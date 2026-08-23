@@ -1565,6 +1565,7 @@ export async function main(args: string[], options?: MainOptions) {
 			messages: parsed.messages,
 			initialMessage,
 			initialImages,
+			eventsPath: parsed.eventsPath,
 		});
 		stopThemeWatcher();
 		restoreStdout();
