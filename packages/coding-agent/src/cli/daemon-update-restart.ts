@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -6,7 +5,7 @@ import lockfile from "proper-lockfile";
 import { ENV_AGENT_DIR, SELF_UPDATE_INTERACTIVE_CHILD_ENV } from "../config.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../core/orphan-process-journal.js";
 import { getProcessStartId, SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
-import { defaultDaemonSocketDir, defaultDaemonSocketPath } from "../modes/daemon/daemon-socket.js";
+import { defaultDaemonSocketDir, defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
@@ -14,7 +13,8 @@ import {
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	DAEMON_WORKER_TOKEN_ENV,
 } from "../modes/daemon/daemon-worker-protocol.js";
-import { createCliSubprocessLaunchSpec } from "./subprocess-launch.js";
+import { isProcessAlive, spawnHidden } from "../utils/child-process.js";
+import { createUpdatedCliSubprocessLaunchSpec } from "./subprocess-launch.js";
 
 export const DAEMON_UPDATE_RESTART_COORDINATOR_FLAG = "--internal-update-restart-coordinator";
 export const DAEMON_UPDATE_RESTART_STATUS_FLAG = "--internal-update-restart-status";
@@ -95,8 +95,7 @@ export interface AcquireDaemonUpdateRestartCoordinatorOptions {
 }
 
 export function resolveDaemonUpdateRestartSocketPath(socketPath?: string): string {
-	const selectedSocketPath = socketPath ?? defaultDaemonSocketPath();
-	return process.platform === "win32" ? selectedSocketPath : resolve(selectedSocketPath);
+	return normalizeSocketPath(socketPath ?? defaultDaemonSocketPath());
 }
 
 const TERMINAL_PHASES: ReadonlySet<DaemonUpdateRestartPhase> = new Set(["complete", "skipped", "failed"]);
@@ -153,8 +152,7 @@ function statusLivenessId(status: DaemonUpdateRestartStatus): string {
 }
 
 function socketKey(socketPath: string): string {
-	const normalized = process.platform === "win32" ? socketPath.toLowerCase() : resolve(socketPath);
-	return createHash("sha256").update(normalized).digest("hex");
+	return createHash("sha256").update(normalizeSocketPath(socketPath)).digest("hex");
 }
 
 function writeJsonAtomically(path: string, value: unknown): void {
@@ -326,11 +324,18 @@ function coordinatorRecordPath(registryDir: string, socketPath: string): string 
 
 async function withCoordinatorRegistryGuard<T>(registryDir: string, action: () => T | Promise<T>): Promise<T> {
 	mkdirSync(registryDir, { recursive: true, mode: 0o700 });
+	let compromisedError: Error | undefined;
+	const assertGuardHeld = () => {
+		if (compromisedError) throw new Error(`Coordinator registry guard was compromised: ${compromisedError.message}`);
+	};
 	const release = await lockfile.lock(registryDir, {
 		realpath: false,
 		lockfilePath: resolve(registryDir, ".guard"),
 		stale: COORDINATOR_REGISTRY_LOCK_STALE_MS,
 		update: COORDINATOR_REGISTRY_LOCK_UPDATE_MS,
+		onCompromised: (error) => {
+			compromisedError ??= error;
+		},
 		retries: {
 			retries: COORDINATOR_REGISTRY_LOCK_RETRIES,
 			factor: 1,
@@ -339,19 +344,14 @@ async function withCoordinatorRegistryGuard<T>(registryDir: string, action: () =
 		},
 	});
 	try {
-		return await action();
+		assertGuardHeld();
+		const result = await action();
+		assertGuardHeld();
+		return result;
 	} finally {
-		await release();
+		if (compromisedError) await release().catch(() => undefined);
+		else await release();
 	}
-}
-
-function isProcessAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code !== "ESRCH";
-	}
-	return true;
 }
 
 function matchesProcessStartId(identity: DaemonUpdateRestartProcessIdentity): boolean {
@@ -538,7 +538,7 @@ export async function launchDaemonUpdateRestartCoordinator(
 	const statusPath = createStatusPath(agentDir, socketPath, requestId);
 	const inheritedOrigin = process.env[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV];
 	const originActiveSessionId = options.originActiveSessionId ?? inheritedOrigin;
-	const launch = createCliSubprocessLaunchSpec([
+	const launch = createUpdatedCliSubprocessLaunchSpec([
 		"update",
 		DAEMON_UPDATE_RESTART_COORDINATOR_FLAG,
 		"--daemon-socket",
@@ -547,7 +547,7 @@ export async function launchDaemonUpdateRestartCoordinator(
 		statusPath,
 		...(originActiveSessionId ? [DAEMON_UPDATE_RESTART_ORIGIN_FLAG, originActiveSessionId] : []),
 	]);
-	const child = spawn(launch.command, launch.args, {
+	const child = spawnHidden(launch.command, launch.args, {
 		cwd: options.cwd ?? process.cwd(),
 		detached: true,
 		env: coordinatorEnvironment(agentDir),

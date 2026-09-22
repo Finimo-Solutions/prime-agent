@@ -1,4 +1,5 @@
 import type { ImageContent } from "@earendil-works/pi-ai";
+import { Container } from "@earendil-works/pi-tui";
 import { describe, expect, it, type Mock, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
@@ -15,6 +16,7 @@ type PromptStash = {
 	expandedText?: string;
 	pasteSnapshot?: FakePasteSnapshot;
 	images?: readonly (readonly [number, ImageContent])[];
+	restoreOnOpen?: boolean;
 };
 
 type FakeEditor = {
@@ -43,7 +45,9 @@ type PromptStashHarness = {
 };
 
 type PromptStashLiveMarkerHarness = PromptStashHarness & {
-	connectionQueue: { steering: string[]; followUp: string[] };
+	connectionState: {
+		sessionActions: { queuedCount: number; steering: readonly string[]; followUps: readonly string[] };
+	};
 };
 
 type SharedPromptStashHarness = PromptStashHarness & {
@@ -70,7 +74,7 @@ type ResetHarness = PromptStashLiveMarkerHarness & {
 	activityTracker: { reset: Mock };
 	contextUsageTokenBaseline: number;
 	agentRunFileChanges: Map<string, unknown>;
-	recapContainer: { clear: Mock };
+	recapContainer: Container;
 	ui: { requestRender: Mock };
 	ipythonToolComponents: Map<string, unknown>;
 	lateIpythonSentAgentMessages: Map<string, unknown>;
@@ -109,6 +113,8 @@ type PromptStashMethods = {
 	hydratePromptStash: (this: SharedPromptStashHarness) => void;
 	resetCurrentSessionRenderState: (this: ResetHarness, options?: { clearPromptStash?: boolean }) => void;
 	restorePromptStashIfEditorEmpty: (this: PromptStashHarness, stash?: PromptStash) => boolean;
+	restorePromptStashOnOpen: (this: PromptStashHarness) => void;
+	stashDraftForAgentsView: (this: SharedPromptStashHarness) => void;
 	liveImageMarkerIds: (this: PromptStashLiveMarkerHarness) => Set<number>;
 	setupEditorSubmitHandler: (this: SubmitHarness) => void;
 };
@@ -322,6 +328,76 @@ describe("InteractiveMode prompt stash", () => {
 		expect(state.queuedStashes).toBeUndefined();
 	});
 
+	it("auto-stashes a draft for the agents view and restores it on reopen", () => {
+		const store = new ClientPromptStashStore();
+		const pasteSnapshot: FakePasteSnapshot = {
+			pastes: [[1, "line one\nline two"]],
+			pasteCounter: 1,
+		};
+		const mode = createSharedPromptStashHarness(store, "session-a", {
+			text: "draft [paste #1 +2 lines]",
+			expandedText: "draft line one\nline two",
+			pasteSnapshot,
+		});
+
+		interactiveModeMethods.stashDraftForAgentsView.call(mode);
+
+		expect(mode.promptStashState.stash).toMatchObject({
+			text: "draft [paste #1 +2 lines]",
+			restoreOnOpen: true,
+		});
+
+		const reopenedMode = createSharedPromptStashHarness(store, "session-a");
+		interactiveModeMethods.hydratePromptStash.call(reopenedMode);
+		interactiveModeMethods.restorePromptStashOnOpen.call(reopenedMode);
+
+		expect(reopenedMode.editor.getText()).toBe("draft [paste #1 +2 lines]");
+		expect(reopenedMode.editor.restoredPasteSnapshot).toBe(pasteSnapshot);
+		expect(reopenedMode.promptStashState.stash).toBeUndefined();
+	});
+
+	it("queues an existing manual stash behind the agents-view auto-stash", () => {
+		const store = new ClientPromptStashStore();
+		const state = store.forSession("session-a");
+		state.stash = { text: "manual draft" };
+		const mode = createSharedPromptStashHarness(store, "session-a", { text: "typed draft" });
+
+		interactiveModeMethods.stashDraftForAgentsView.call(mode);
+
+		expect(state.stash).toMatchObject({ text: "typed draft", restoreOnOpen: true });
+		expect(state.queuedStashes).toEqual([{ text: "manual draft" }]);
+
+		const reopenedMode = createSharedPromptStashHarness(store, "session-a");
+		interactiveModeMethods.restorePromptStashOnOpen.call(reopenedMode);
+
+		expect(reopenedMode.editor.getText()).toBe("typed draft");
+		expect(state.stash).toEqual({ text: "manual draft" });
+		expect(state.queuedStashes).toBeUndefined();
+	});
+
+	it("skips the agents-view auto-stash for whitespace-only drafts", () => {
+		const store = new ClientPromptStashStore();
+		const state = store.forSession("session-a");
+		state.stash = { text: "manual draft" };
+		const mode = createSharedPromptStashHarness(store, "session-a", { text: "   \n\t" });
+
+		interactiveModeMethods.stashDraftForAgentsView.call(mode);
+
+		expect(state.stash).toEqual({ text: "manual draft" });
+		expect(state.queuedStashes).toBeUndefined();
+	});
+
+	it("does not auto-restore a manual stash on reopen", () => {
+		const store = new ClientPromptStashStore();
+		store.forSession("session-a").stash = { text: "manual draft" };
+
+		const reopenedMode = createSharedPromptStashHarness(store, "session-a");
+		interactiveModeMethods.restorePromptStashOnOpen.call(reopenedMode);
+
+		expect(reopenedMode.editor.getText()).toBe("");
+		expect(store.forSession("session-a").stash).toEqual({ text: "manual draft" });
+	});
+
 	it("rebinds prompt stash state when the connected session changes", () => {
 		const store = new ClientPromptStashStore();
 		const firstState = store.forSession("session-a");
@@ -384,16 +460,6 @@ describe("InteractiveMode prompt stash", () => {
 		expect(mode.editor.restoredPasteSnapshot).toBeUndefined();
 	});
 
-	it("restores a stashed prompt when the editor is empty", () => {
-		const mode = createPromptStashHarness({ stash: "half-written draft" });
-
-		interactiveModeMethods.handlePromptStash.call(mode);
-
-		expect(mode.promptStash).toBeUndefined();
-		expect(mode.editor.getText()).toBe("half-written draft");
-		expect(mode.showStatus).toHaveBeenCalledWith("Restored stashed prompt");
-	});
-
 	it("does not restore an older captured stash after a newer stash is created", () => {
 		const mode = createPromptStashHarness({ stash: "older draft" });
 		const olderStash = mode.promptStash;
@@ -448,20 +514,44 @@ describe("InteractiveMode prompt stash", () => {
 		expect(mode.showStatus).toHaveBeenCalledWith("Prompt stash already has a draft");
 	});
 
-	it("restores a stashed prompt after normal message submission clears the editor", async () => {
-		const mode = createSubmitHarness({ stash: "half-written draft" });
+	// One restore path, three ways the editor gets emptied by the surviving submission.
+	it.each(["normal submission", "/new reset", "async session selector"] as const)(
+		"restores a stashed prompt after %s clears the editor",
+		async (path) => {
+			const selector = createDeferred();
+			const mode = Object.assign(createSubmitHarness({ stash: "half-written draft" }), {
+				handleClearCommand: vi.fn(async () => {
+					mode.editor.setText("");
+				}),
+				showUserMessageSelector: vi.fn(async () => {
+					await selector.promise;
+					mode.editor.setText("");
+				}),
+			});
 
-		await mode.defaultEditor.onSubmit?.("temporary prompt");
+			if (path === "normal submission") {
+				await mode.defaultEditor.onSubmit?.("temporary prompt");
+				expect(mode.agentConnection.prompt).toHaveBeenCalledWith("temporary prompt", {
+					streamingBehavior: "steer",
+					queueIfBusy: true,
+					images: [],
+				});
+				expect(mode.editor.addToHistory).toHaveBeenCalledWith("temporary prompt");
+			} else if (path === "/new reset") {
+				await mode.defaultEditor.onSubmit?.("/new");
+				expect(mode.handleClearCommand).toHaveBeenCalled();
+			} else {
+				const submit = mode.defaultEditor.onSubmit?.("/fork");
+				await Promise.resolve();
+				selector.resolve();
+				await submit;
+				expect(mode.showUserMessageSelector).toHaveBeenCalled();
+			}
 
-		expect(mode.agentConnection.prompt).toHaveBeenCalledWith("temporary prompt", {
-			streamingBehavior: "steer",
-			queueIfBusy: true,
-			images: [],
-		});
-		expect(mode.editor.addToHistory).toHaveBeenCalledWith("temporary prompt");
-		expect(mode.promptStash).toBeUndefined();
-		expect(mode.editor.getText()).toBe("half-written draft");
-	});
+			expect(mode.promptStash).toBeUndefined();
+			expect(mode.editor.getText()).toBe("half-written draft");
+		},
+	);
 
 	it("routes session-owned commands through canonical prompt admission", async () => {
 		const mode = Object.assign(createSubmitHarness(), { isAgentCompacting: () => true });
@@ -477,39 +567,6 @@ describe("InteractiveMode prompt stash", () => {
 				images: [],
 			});
 		}
-	});
-
-	it("restores a stashed prompt after a session reset clears prompt state", async () => {
-		const mode = Object.assign(createSubmitHarness({ stash: "half-written draft" }), {
-			handleClearCommand: vi.fn(async () => {
-				mode.editor.setText("");
-			}),
-		});
-
-		await mode.defaultEditor.onSubmit?.("/new");
-
-		expect(mode.handleClearCommand).toHaveBeenCalled();
-		expect(mode.promptStash).toBeUndefined();
-		expect(mode.editor.getText()).toBe("half-written draft");
-	});
-
-	it("waits for async session selectors before restoring a stashed prompt", async () => {
-		const selector = createDeferred();
-		const mode = Object.assign(createSubmitHarness({ stash: "half-written draft" }), {
-			showUserMessageSelector: vi.fn(async () => {
-				await selector.promise;
-				mode.editor.setText("");
-			}),
-		});
-
-		const submit = mode.defaultEditor.onSubmit?.("/fork");
-		await Promise.resolve();
-		selector.resolve();
-		await submit;
-
-		expect(mode.showUserMessageSelector).toHaveBeenCalled();
-		expect(mode.promptStash).toBeUndefined();
-		expect(mode.editor.getText()).toBe("half-written draft");
 	});
 
 	it("owns Alt+Enter /settings locally while preserving the stashed prompt", async () => {
@@ -536,26 +593,23 @@ describe("InteractiveMode prompt stash", () => {
 		expect(mode.editor.getText()).toBe("half-written draft");
 	});
 
-	it("drops queued image references from old sessions while keeping stashed images", () => {
-		const base = createPromptStashHarness({ stash: "keep [image #1]" });
+	function createResetHarness(stash: string, imageIds: readonly number[]): ResetHarness {
+		const base = createPromptStashHarness({ stash });
 		const mode: ResetHarness = {
 			...base,
 			defaultEditor: base.editor,
 			queueSelection: new QueueSelection(),
-			connectionQueue: { steering: ["old [image #2]"], followUp: [] },
+			connectionState: { sessionActions: { queuedCount: 0, steering: [], followUps: [] } },
 			chatContainer: { clear: vi.fn() },
 			shortcutGuideContainer: { clear: vi.fn() },
 			pendingMessagesContainer: { clear: vi.fn() },
 			queuedMessagesContainer: { clear: vi.fn() },
-			pastedImages: new Map<number, unknown>([
-				[1, {}],
-				[2, {}],
-			]),
+			pastedImages: new Map<number, unknown>(imageIds.map((id) => [id, {}])),
 			pendingBashComponents: [],
 			activityTracker: { reset: vi.fn() },
 			contextUsageTokenBaseline: 1,
 			agentRunFileChanges: new Map(),
-			recapContainer: { clear: vi.fn() },
+			recapContainer: new Container(),
 			ui: { requestRender: vi.fn() },
 			ipythonToolComponents: new Map(),
 			lateIpythonSentAgentMessages: new Map(),
@@ -566,42 +620,21 @@ describe("InteractiveMode prompt stash", () => {
 			syncGoalTray: vi.fn(),
 		};
 		Object.setPrototypeOf(mode, InteractiveMode.prototype);
+		return mode;
+	}
+
+	it("drops old-session images while keeping stashed images", () => {
+		const mode = createResetHarness("keep [image #1]", [1, 2]);
 
 		interactiveModeMethods.resetCurrentSessionRenderState.call(mode);
 
-		expect(mode.connectionQueue).toEqual({ steering: [], followUp: [] });
 		expect(mode.promptStash?.text).toBe("keep [image #1]");
 		expect(mode.pastedImages.has(1)).toBe(true);
 		expect(mode.pastedImages.has(2)).toBe(false);
 	});
 
 	it("clears stashed prompt state when explicitly requested", () => {
-		const base = createPromptStashHarness({ stash: "drop [image #1]" });
-		const mode: ResetHarness = {
-			...base,
-			defaultEditor: base.editor,
-			queueSelection: new QueueSelection(),
-			connectionQueue: { steering: [], followUp: [] },
-			chatContainer: { clear: vi.fn() },
-			shortcutGuideContainer: { clear: vi.fn() },
-			pendingMessagesContainer: { clear: vi.fn() },
-			queuedMessagesContainer: { clear: vi.fn() },
-			pastedImages: new Map<number, unknown>([[1, {}]]),
-			pendingBashComponents: [],
-			activityTracker: { reset: vi.fn() },
-			contextUsageTokenBaseline: 1,
-			agentRunFileChanges: new Map(),
-			recapContainer: { clear: vi.fn() },
-			ui: { requestRender: vi.fn() },
-			ipythonToolComponents: new Map(),
-			lateIpythonSentAgentMessages: new Map(),
-			resetPendingToolState: vi.fn(),
-			resetSubagentSummary: vi.fn(),
-			setGoalAnnouncementBaseline: vi.fn(),
-			getGoalState: vi.fn(() => undefined),
-			syncGoalTray: vi.fn(),
-		};
-		Object.setPrototypeOf(mode, InteractiveMode.prototype);
+		const mode = createResetHarness("drop [image #1]", [1]);
 
 		interactiveModeMethods.resetCurrentSessionRenderState.call(mode, { clearPromptStash: true });
 
@@ -726,10 +759,167 @@ describe("InteractiveMode prompt stash", () => {
 	it("keeps image markers in a stashed prompt live", () => {
 		const mode: PromptStashLiveMarkerHarness = {
 			...createPromptStashHarness({ stash: "look at [image #7]" }),
-			connectionQueue: { steering: [], followUp: [] },
+			connectionState: { sessionActions: { queuedCount: 0, steering: [], followUps: [] } },
 		};
 		Object.setPrototypeOf(mode, InteractiveMode.prototype);
 
 		expect(interactiveModeMethods.liveImageMarkerIds.call(mode)).toEqual(new Set([7]));
+	});
+});
+
+describe("InteractiveMode prompt stash session releases", () => {
+	function createHandoffMode(): Record<string, any> {
+		const editor = { getText: () => "draft prompt" };
+		const mode: Record<string, any> = {
+			options: { returnToAgentsView: true },
+			editor,
+			editorContainer: { children: [editor] as unknown[] },
+			ui: { hasOverlay: () => false },
+			heartbeatCatalog: [],
+			subagentSnapshots: new Map(),
+			connectionState: { messageCount: 0, isStreaming: false },
+		};
+		Object.setPrototypeOf(mode, InteractiveMode.prototype);
+		return mode;
+	}
+
+	it("defers stash-store release until lifecycle-retained submissions settle", () => {
+		const store = new ClientPromptStashStore();
+		const state = store.forSession("session-a");
+		const fakeThis = {
+			inputSubmissionsPending: 1,
+			pendingPromptStashReleases: [] as { sessionId: string; state: unknown }[],
+			promptStashStore: store,
+			promptStashSessionId: "session-a",
+			promptStashState: state,
+			retainedSubmissionGenerations: new WeakMap(),
+		};
+		const release = (InteractiveMode.prototype as unknown as { releasePromptStashSession(this: unknown): void })
+			.releasePromptStashSession;
+		const retain = (
+			InteractiveMode.prototype as unknown as {
+				retainSubmittedDraft(this: unknown, stash: { text: string }, generation: number): void;
+			}
+		).retainSubmittedDraft;
+
+		release.call(fakeThis);
+		expect(fakeThis.pendingPromptStashReleases).toEqual([{ sessionId: "session-a", state }]);
+		expect(store.forSession("session-a")).toBe(state);
+		retain.call(fakeThis, { text: "retained" }, 1);
+		fakeThis.inputSubmissionsPending = 0;
+		release.call(fakeThis);
+		expect(store.forSession("session-a")).toBe(state);
+		expect(state.stash).toEqual({ text: "retained" });
+	});
+	it("a deferred release targets the session captured at deferral, not a rebound one", () => {
+		const store = new ClientPromptStashStore();
+		const oldState = store.forSession("session-old");
+		const fakeThis = {
+			inputSubmissionsPending: 1,
+			pendingPromptStashReleases: [] as { sessionId: string; state: unknown }[],
+			promptStashStore: store,
+			promptStashSessionId: "session-old",
+			promptStashState: oldState,
+		};
+		const methods = InteractiveMode.prototype as unknown as {
+			releasePromptStashSession(this: unknown): void;
+			completeDeferredPromptStashRelease(this: unknown): void;
+		};
+
+		methods.releasePromptStashSession.call(fakeThis);
+		const newState = store.forSession("session-new");
+		newState.stash = { text: "new session draft" };
+		fakeThis.promptStashSessionId = "session-new";
+		fakeThis.promptStashState = newState;
+
+		fakeThis.inputSubmissionsPending = 0;
+		methods.completeDeferredPromptStashRelease.call(fakeThis);
+
+		expect(store.forSession("session-old")).not.toBe(oldState);
+		expect(store.forSession("session-new")).toBe(newState);
+		expect(newState.stash).toEqual({ text: "new session draft" });
+	});
+	it("a teardown release after a rebind keeps both deferred session releases", () => {
+		const store = new ClientPromptStashStore();
+		const oldState = store.forSession("session-old");
+		const fakeThis = {
+			inputSubmissionsPending: 1,
+			pendingPromptStashReleases: [] as { sessionId: string; state: unknown }[],
+			promptStashStore: store,
+			promptStashSessionId: "session-old",
+			promptStashState: oldState,
+		};
+		const methods = InteractiveMode.prototype as unknown as {
+			releasePromptStashSession(this: unknown): void;
+			completeDeferredPromptStashRelease(this: unknown): void;
+		};
+
+		// /new rebind defers the old session's release...
+		methods.releasePromptStashSession.call(fakeThis);
+		const newState = store.forSession("session-new");
+		fakeThis.promptStashSessionId = "session-new";
+		fakeThis.promptStashState = newState;
+		// ...then teardown defers the rebound session's release while the same
+		// submission is still pending. The first pair must not be overwritten.
+		methods.releasePromptStashSession.call(fakeThis);
+		expect(fakeThis.pendingPromptStashReleases.map((pending) => pending.sessionId)).toEqual([
+			"session-old",
+			"session-new",
+		]);
+
+		fakeThis.inputSubmissionsPending = 0;
+		methods.completeDeferredPromptStashRelease.call(fakeThis);
+
+		expect(store.forSession("session-old")).not.toBe(oldState);
+		expect(store.forSession("session-new")).not.toBe(newState);
+	});
+	it("orders retained drafts by submission rather than rejection", () => {
+		const state: PromptStashState = {};
+		const fakeThis = {
+			promptStashState: state,
+			retainedSubmissionGenerations: new WeakMap(),
+		};
+		Object.defineProperty(fakeThis, "promptStash", {
+			get: () => state.stash,
+			set: (stash) => {
+				state.stash = stash;
+			},
+		});
+		const retain = (
+			InteractiveMode.prototype as unknown as {
+				retainSubmittedDraft(this: unknown, stash: { text: string }, generation: number): void;
+			}
+		).retainSubmittedDraft;
+
+		retain.call(fakeThis, { text: "second" }, 2);
+		retain.call(fakeThis, { text: "first" }, 1);
+		expect(state.stash).toEqual({ text: "first" });
+		expect(state.queuedStashes).toEqual([{ text: "second" }]);
+	});
+
+	it("stashes the draft once per agents-view handoff even when re-requested mid-teardown", async () => {
+		const promptStashState: PromptStashState = {};
+		let resolveDispose!: () => void;
+		const disposePromise = new Promise<void>((resolve) => {
+			resolveDispose = resolve;
+		});
+		const mode = Object.assign(createHandoffMode(), {
+			promptStashState,
+			pastedImages: new Map(),
+			isShuttingDown: false,
+			agentsViewRequest: undefined,
+			unregisterSignalHandlers: vi.fn(),
+			teardownSessionUi: vi.fn(async () => {}),
+			agentConnection: { dispose: vi.fn(() => disposePromise) },
+		});
+		const returnToAgentsView = Reflect.get(InteractiveMode.prototype, "returnToAgentsView");
+
+		const firstHandoff = returnToAgentsView.call(mode);
+		await returnToAgentsView.call(mode);
+
+		expect(promptStashState.stash).toMatchObject({ text: "draft prompt", restoreOnOpen: true });
+		expect(promptStashState.queuedStashes).toBeUndefined();
+		resolveDispose();
+		await firstHandoff;
 	});
 });

@@ -6,7 +6,11 @@ import type {
 	MessageParam,
 	RawMessageStreamEvent,
 } from "@anthropic-ai/sdk/resources/messages.js";
-import { getAnthropicCacheWriteCost, hasStandardAnthropicCachePricing } from "../cache-pricing.js";
+import {
+	type AnthropicCacheCreationUsage,
+	getAnthropicCacheWriteCost,
+	hasStandardAnthropicCachePricing,
+} from "../cache-pricing.js";
 import { getEnvApiKey } from "../env-api-keys.js";
 import { calculateCost, clampThinkingLevel } from "../models.js";
 import type {
@@ -44,6 +48,7 @@ import {
 
 import { resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
+import { withOpenCodeHeaders } from "./opencode-headers.js";
 import { adjustMaxTokensForThinking, buildBaseOptions } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
 
@@ -77,7 +82,7 @@ function getCacheControl(
 }
 
 // Stealth mode: Mimic Claude Code's tool naming exactly
-const claudeCodeVersion = "2.1.75";
+const claudeCodeVersion = "2.1.261";
 
 // Claude Code 2.x tool names (canonical casing)
 // Source: https://cchistory.mariozechner.at/data/prompts-2.1.11.md
@@ -104,7 +109,6 @@ const claudeCodeTools = [
 
 const ccToolLookup = new Map(claudeCodeTools.map((t) => [t.toLowerCase(), t]));
 
-// Convert tool name to CC canonical casing if it matches (case-insensitive)
 const toClaudeCodeName = (name: string) => ccToolLookup.get(name.toLowerCase()) ?? name;
 const fromClaudeCodeName = (name: string, tools?: Tool[]) => {
 	if (tools && tools.length > 0) {
@@ -131,13 +135,11 @@ function convertContentBlocks(content: (TextContent | ImageContent)[]):
 					};
 			  }
 	  > {
-	// If only text blocks, return as concatenated string for simplicity
 	const hasImages = content.some((c) => c.type === "image");
 	if (!hasImages) {
 		return sanitizeSurrogates(content.map((c) => (c as TextContent).text).join("\n"));
 	}
 
-	// If we have images, convert to content block array
 	const blocks = content.map((block) => {
 		if (block.type === "text") {
 			return {
@@ -155,7 +157,6 @@ function convertContentBlocks(content: (TextContent | ImageContent)[]):
 		};
 	});
 
-	// If only images (no text), add placeholder text block
 	const hasText = blocks.some((b) => b.type === "text");
 	if (!hasText) {
 		blocks.unshift({
@@ -507,6 +508,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 					shouldUseFineGrainedToolStreamingBeta(model, context),
 					options?.headers,
 					copilotDynamicHeaders,
+					options?.sessionId,
 				);
 				client = created.client;
 				isOAuth = created.isOAuthToken;
@@ -525,7 +527,6 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
-				...(options?.maxRetries !== undefined ? { maxRetries: options.maxRetries } : {}),
 			};
 			const response = await client.messages.create({ ...params, stream: true }, requestOptions).asResponse();
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
@@ -544,7 +545,6 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 					output.usage.output = event.message.usage.output_tokens || 0;
 					output.usage.cacheRead = event.message.usage.cache_read_input_tokens || 0;
 					output.usage.cacheWrite = event.message.usage.cache_creation_input_tokens || 0;
-					// Anthropic doesn't provide total_tokens, compute from components
 					output.usage.totalTokens =
 						output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 					if (cacheControl && usesAnthropicCachePricing) {
@@ -700,7 +700,16 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 					if (event.usage.cache_creation_input_tokens != null) {
 						output.usage.cacheWrite = event.usage.cache_creation_input_tokens;
 					}
-					// Anthropic doesn't provide total_tokens, compute from components
+					// The SDK's MessageDeltaUsage type omits cache_creation, but the wire carries it.
+					const deltaCacheCreation = (event.usage as { cache_creation?: AnthropicCacheCreationUsage | null })
+						.cache_creation;
+					if (cacheControl && usesAnthropicCachePricing && deltaCacheCreation) {
+						cacheWriteCost = getAnthropicCacheWriteCost(
+							model.cost.input,
+							cacheControl.ttl === "1h" ? "1h" : "5m",
+							deltaCacheCreation,
+						);
+					}
 					output.usage.totalTokens =
 						output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 					calculateCost(
@@ -812,7 +821,7 @@ export const streamSimpleAnthropic: StreamFunction<"anthropic-messages", SimpleS
 	}
 
 	const base = buildBaseOptions(model, options, apiKey);
-	if (!options?.reasoning) {
+	if (!options?.reasoning || options.reasoning === "off") {
 		return streamAnthropic(model, context, { ...base, thinkingEnabled: false } satisfies AnthropicOptions);
 	}
 
@@ -853,6 +862,7 @@ function createClient(
 	useFineGrainedToolStreamingBeta: boolean,
 	optionsHeaders?: Record<string, string>,
 	dynamicHeaders?: Record<string, string>,
+	sessionId?: string,
 ): { client: Anthropic; isOAuthToken: boolean } {
 	// Adaptive thinking models (Opus 4.6, Sonnet 4.6) have interleaved thinking built-in.
 	// The beta header is deprecated on Opus 4.6 and redundant on Sonnet 4.6, so skip it.
@@ -867,6 +877,7 @@ function createClient(
 
 	if (model.provider === "cloudflare-ai-gateway") {
 		const client = new Anthropic({
+			maxRetries: 0,
 			apiKey: null,
 			authToken: null,
 			baseURL: resolveCloudflareBaseUrl(model),
@@ -888,9 +899,9 @@ function createClient(
 		return { client, isOAuthToken: false };
 	}
 
-	// Copilot: Bearer auth, selective betas.
 	if (model.provider === "github-copilot") {
 		const client = new Anthropic({
+			maxRetries: 0,
 			apiKey: null,
 			authToken: apiKey,
 			baseURL: model.baseUrl,
@@ -910,9 +921,9 @@ function createClient(
 		return { client, isOAuthToken: false };
 	}
 
-	// OAuth: Bearer auth, Claude Code identity headers
 	if (isOAuthToken(apiKey)) {
 		const client = new Anthropic({
+			maxRetries: 0,
 			apiKey: null,
 			authToken: apiKey,
 			baseURL: model.baseUrl,
@@ -933,19 +944,23 @@ function createClient(
 		return { client, isOAuthToken: true };
 	}
 
-	// API key auth
 	const client = new Anthropic({
+		maxRetries: 0,
 		apiKey,
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,
-		defaultHeaders: mergeHeaders(
-			{
-				accept: "application/json",
-				"anthropic-dangerous-direct-browser-access": "true",
-				...(betaFeatures.length > 0 ? { "anthropic-beta": betaFeatures.join(",") } : {}),
-			},
-			model.headers,
-			optionsHeaders,
+		defaultHeaders: withOpenCodeHeaders(
+			model.provider,
+			sessionId,
+			mergeHeaders(
+				{
+					accept: "application/json",
+					"anthropic-dangerous-direct-browser-access": "true",
+					...(betaFeatures.length > 0 ? { "anthropic-beta": betaFeatures.join(",") } : {}),
+				},
+				model.headers,
+				optionsHeaders,
+			),
 		),
 	});
 
@@ -1028,7 +1043,6 @@ function buildParams(
 							: { effort: options.effort };
 				}
 			} else {
-				// Budget-based thinking for older models
 				params.thinking = {
 					type: "enabled",
 					budget_tokens: options.thinkingBudgetTokens || 1024,
@@ -1071,7 +1085,6 @@ function convertMessages(
 ): MessageParam[] {
 	const params: MessageParam[] = [];
 
-	// Transform messages for cross-provider compatibility
 	const transformedMessages = transformMessages(messages, model, normalizeToolCallId);
 
 	for (let i = 0; i < transformedMessages.length; i++) {
@@ -1168,7 +1181,6 @@ function convertMessages(
 			// Collect all consecutive toolResult messages, needed for z.ai Anthropic endpoint
 			const toolResults: ContentBlockParam[] = [];
 
-			// Add the current tool result
 			toolResults.push({
 				type: "tool_result",
 				tool_use_id: msg.toolCallId,
@@ -1176,7 +1188,6 @@ function convertMessages(
 				is_error: msg.isError,
 			});
 
-			// Look ahead for consecutive toolResult messages
 			let j = i + 1;
 			while (j < transformedMessages.length && transformedMessages[j].role === "toolResult") {
 				const nextMsg = transformedMessages[j] as ToolResultMessage; // We know it's a toolResult
@@ -1189,10 +1200,8 @@ function convertMessages(
 				j++;
 			}
 
-			// Skip the messages we've already processed
 			i = j - 1;
 
-			// Add a single user message with all tool results
 			params.push({
 				role: "user",
 				content: toolResults,

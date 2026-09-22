@@ -1,8 +1,8 @@
-import { spawnSync } from "child_process";
 import { randomUUID } from "crypto";
 import { readFileSync, unlinkSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { spawnSyncHidden } from "./child-process.js";
 
 import { clipboard } from "./clipboard-native.js";
 import { loadPhoton } from "./photon.js";
@@ -25,21 +25,6 @@ export function isWaylandSession(env: NodeJS.ProcessEnv = process.env): boolean 
 
 function baseMimeType(mimeType: string): string {
 	return mimeType.split(";")[0]?.trim().toLowerCase() ?? mimeType.toLowerCase();
-}
-
-export function extensionForImageMimeType(mimeType: string): string | null {
-	switch (baseMimeType(mimeType)) {
-		case "image/png":
-			return "png";
-		case "image/jpeg":
-			return "jpg";
-		case "image/webp":
-			return "webp";
-		case "image/gif":
-			return "gif";
-		default:
-			return null;
-	}
 }
 
 function selectPreferredImageMimeType(mimeTypes: string[]): string | null {
@@ -94,7 +79,7 @@ function runCommand(
 	const timeoutMs = options?.timeoutMs ?? DEFAULT_READ_TIMEOUT_MS;
 	const maxBufferBytes = options?.maxBufferBytes ?? DEFAULT_MAX_BUFFER_BYTES;
 
-	const result = spawnSync(command, args, {
+	const result = spawnSyncHidden(command, args, {
 		timeout: timeoutMs,
 		maxBuffer: maxBufferBytes,
 		env: options?.env,

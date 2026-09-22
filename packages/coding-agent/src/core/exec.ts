@@ -2,8 +2,7 @@
  * Shared command execution utilities for extensions and custom tools.
  */
 
-import { spawn } from "node:child_process";
-import { waitForChildProcess } from "../utils/child-process.js";
+import { spawnHidden, waitForChildProcess } from "../utils/child-process.js";
 
 /**
  * Options for executing shell commands.
@@ -58,7 +57,7 @@ export async function execCommand(
 	options?: ExecOptions,
 ): Promise<ExecResult> {
 	return new Promise((resolve) => {
-		const proc = spawn(command, args, {
+		const proc = spawnHidden(command, args, {
 			cwd,
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
@@ -77,7 +76,6 @@ export async function execCommand(
 			if (!killed) {
 				killed = true;
 				proc.kill("SIGTERM");
-				// Force kill after 5 seconds if SIGTERM doesn't work
 				forceKillTimeoutId = setTimeout(() => {
 					forceKillTimeoutId = undefined;
 					if (proc.exitCode === null && proc.signalCode === null) {
@@ -87,7 +85,6 @@ export async function execCommand(
 			}
 		};
 
-		// Handle abort signal
 		if (options?.signal) {
 			if (options.signal.aborted) {
 				killProcess();
@@ -96,7 +93,6 @@ export async function execCommand(
 			}
 		}
 
-		// Handle timeout
 		if (options?.timeout && options.timeout > 0) {
 			timeoutId = setTimeout(() => {
 				killProcess();

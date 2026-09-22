@@ -16,35 +16,24 @@ import { ModelRegistry } from "./model-registry.js";
 import { DefaultResourceLoader, type DefaultResourceLoaderOptions, type ResourceLoader } from "./resource-loader.js";
 import type { SubagentRuntimeHost } from "./rlm-runtime.js";
 import { type CreateAgentSessionResult, createAgentSession } from "./sdk.js";
+import { semanticEdgeLedgerPath } from "./semantic-edges.js";
 import type { SessionManager } from "./session-manager.js";
 import { SettingsManager } from "./settings-manager.js";
 import { installAgentTelemetry, isTelemetryEnabled } from "./telemetry.js";
 
-/**
- * Non-fatal issues collected while creating services or sessions.
- *
- * Runtime creation returns diagnostics to the caller instead of printing or
- * exiting. The app layer decides whether warnings should be shown and whether
- * errors should abort startup.
- */
 export interface AgentSessionRuntimeDiagnostic {
 	type: "info" | "warning" | "error";
 	message: string;
 }
 
-/**
- * Inputs for creating cwd-bound runtime services.
- *
- * These services are recreated whenever the effective session cwd changes.
- * CLI-provided resource paths should be resolved to absolute paths before they
- * reach this function, so later cwd switches do not reinterpret them.
- */
 export interface CreateAgentSessionServicesOptions {
 	cwd: string;
 	agentDir?: string;
 	authStorage?: AuthStorage;
 	settingsManager?: SettingsManager;
 	modelRegistry?: ModelRegistry;
+	/** Pre-built MCP manager (tests inject stub probes and stores). */
+	mcpManager?: McpManager;
 	extensionFlagValues?: Map<string, boolean | string>;
 	resourceLoaderOptions?: Omit<DefaultResourceLoaderOptions, "cwd" | "agentDir" | "settingsManager">;
 	/**
@@ -54,14 +43,18 @@ export interface CreateAgentSessionServicesOptions {
 	 * would release the pane while the parent is still running.
 	 */
 	noBuiltinHerdrReporter?: boolean;
-	/** Explicit daemon-carried opt-out; cannot enable telemetry. */
 	telemetryDisabled?: true;
+	/**
+	 * Hold the telemetry disclosure back on a first interactive launch, where it
+	 * would land on the onboarding screen. Onboarding marks itself shown, so the
+	 * notice appears on the next launch; sessions that never onboard disclose now.
+	 */
+	deferTelemetryNoticeForOnboarding?: boolean;
 }
 
 export interface AgentSessionCreationOptions {
 	model?: Model<any>;
 	thinkingLevel?: ThinkingLevel;
-	/** Provider service tier. Fast mode uses "priority". */
 	serviceTier?: ServiceTier;
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 	tools?: string[];
@@ -78,38 +71,24 @@ export interface AgentSessionCreationOptions {
 	rlmSessionDir?: string;
 	rlmParentNodeId?: string;
 	rlmParentAgent?: string;
+	semanticParentSessionId?: string;
+	semanticSpawnedByRequestId?: string;
 	subagentRuntimeHost?: SubagentRuntimeHost;
 	rlmHeartbeatController?: AgentRlmHeartbeatController;
 	prewarmIpythonKernel?: boolean;
 	autonomous?: AgentAutonomousConfig;
-	/** Serialized refine mode for print/headless autonomous runs. */
 	serializedRefine?: boolean;
-	/** User-facing client mode that created the top-level session. */
 	executionMode?: AgentExecutionMode;
-	/** Explicit daemon-carried opt-out; cannot enable telemetry. */
 	telemetryDisabled?: true;
-	/** Initial goal to seed at session creation (rlmDepth 0 only, idempotent). */
 	initialGoal?: { objective: string; tokenBudget?: number };
 }
 
-/**
- * Inputs for creating an AgentSession from already-created services.
- *
- * Use this after services exist and any cwd-bound model/tool/session options
- * have been resolved against those services.
- */
 export interface CreateAgentSessionFromServicesOptions extends AgentSessionCreationOptions {
 	services: AgentSessionServices;
 	sessionManager: SessionManager;
 	sessionStartEvent?: SessionStartEvent;
 }
 
-/**
- * Coherent cwd-bound runtime services for one effective session cwd.
- *
- * This is infrastructure only. The AgentSession itself is created separately so
- * session options can be resolved against these services first.
- */
 export interface AgentSessionServices {
 	cwd: string;
 	agentDir: string;
@@ -169,28 +148,28 @@ function applyExtensionFlagValues(
 	return diagnostics;
 }
 
-/**
- * Create cwd-bound runtime services.
- *
- * Returns services plus diagnostics. It does not create an AgentSession.
- */
 export async function createAgentSessionServices(
 	options: CreateAgentSessionServicesOptions,
 ): Promise<AgentSessionServices> {
 	const cwd = options.cwd;
 	const agentDir = options.agentDir ?? getAgentDir();
-	const authStorage = options.authStorage ?? AuthStorage.create(join(agentDir, "auth.json"));
+	const authStorage =
+		options.authStorage ??
+		AuthStorage.create(options.agentDir === undefined ? undefined : join(agentDir, "auth.json"));
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const modelRegistry = options.modelRegistry ?? ModelRegistry.create(authStorage, join(agentDir, "models.json"));
 
 	// MCP integrations: registers OAuth providers and gates the built-in
 	// integration skills by whether the user is logged in (enable-by-login).
-	const mcpManager = new McpManager({
-		authStorage,
-		getUserServers: () => settingsManager.getMcpServers(),
-	});
+	const mcpManager =
+		options.mcpManager ??
+		new McpManager({
+			authStorage,
+			getUserServers: () => settingsManager.getGlobalMcpServers(),
+			getCatalogSources: () => settingsManager.getMcpCatalogSources(),
+		});
 	// refresh() resets the OAuth registry to built-ins; re-add user MCP providers too.
-	modelRegistry.setOnOAuthProvidersReset(() => mcpManager.registerUserProviders());
+	modelRegistry.setOnOAuthProvidersReset(() => mcpManager.registerAllProviders());
 
 	const userExtensionFactories = options.resourceLoaderOptions?.extensionFactories ?? [];
 	// The built-in Herdr reporter defers to Herdr's own file-based integration
@@ -218,6 +197,10 @@ export async function createAgentSessionServices(
 	if (
 		!options.telemetryDisabled &&
 		isTelemetryEnabled(settingsManager) &&
+		// A first interactive launch belongs to onboarding, where the notice would
+		// land on the welcome screen; it surfaces on the next launch once
+		// onboarding marks itself shown. Sessions that never onboard disclose now.
+		(settingsManager.getOnboardingShown() || !options.deferTelemetryNoticeForOnboarding) &&
 		!settingsManager.getTelemetryNoticeShown()
 	) {
 		diagnostics.push({
@@ -254,19 +237,16 @@ export async function createAgentSessionServices(
 	};
 }
 
-/**
- * Create an AgentSession from previously created services.
- *
- * This keeps session creation separate from service creation so callers can
- * resolve model, thinking, tools, and other session inputs against the target
- * cwd before constructing the session.
- */
 export async function createAgentSessionFromServices(
 	options: CreateAgentSessionFromServicesOptions,
 ): Promise<CreateAgentSessionResult> {
 	installAgentTraceUpload(options.sessionManager, {
 		authStorage: options.services.authStorage,
 		settingsManager: options.services.settingsManager,
+		semanticEdgesLedgerPath: semanticEdgeLedgerPath({
+			rlmSessionDir: options.rlmSessionDir,
+			sessionArtifactDir: options.sessionManager.getSessionArtifactDir(),
+		}),
 	});
 	const result = await createAgentSession({
 		cwd: options.services.cwd,
@@ -295,6 +275,8 @@ export async function createAgentSessionFromServices(
 		rlmSessionDir: options.rlmSessionDir,
 		rlmParentNodeId: options.rlmParentNodeId,
 		rlmParentAgent: options.rlmParentAgent,
+		semanticParentSessionId: options.semanticParentSessionId,
+		semanticSpawnedByRequestId: options.semanticSpawnedByRequestId,
 		subagentRuntimeHost: options.subagentRuntimeHost,
 		rlmHeartbeatController: options.rlmHeartbeatController,
 		sessionStartEvent: options.sessionStartEvent,

@@ -12,6 +12,16 @@ interface InputState {
 	cursor: number;
 }
 
+export interface InputOptions {
+	/**
+	 * Render the value as bullets while keeping the real buffer for edits and
+	 * submit: a pasted secret is never drawn, but getValue()/onSubmit still
+	 * return exactly what was typed. Cursor math maps by grapheme so editing
+	 * (backspace, word moves, paste) behaves exactly like the unmasked input.
+	 */
+	masked?: boolean;
+}
+
 /**
  * Input component - single-line text input with horizontal scrolling
  */
@@ -21,18 +31,16 @@ export class Input implements Component, Focusable {
 	public onSubmit?: (value: string) => void;
 	public onEscape?: () => void;
 
-	/** Focusable interface - set by TUI when focus changes */
 	focused: boolean = false;
 
-	// Bracketed paste mode buffering
+	constructor(private readonly options: InputOptions = {}) {}
+
 	private pasteBuffer: string = "";
 	private isInPaste: boolean = false;
 
-	// Kill ring for Emacs-style kill/yank operations
 	private killRing = new KillRing();
 	private lastAction: "kill" | "yank" | "type-word" | null = null;
 
-	// Undo support
 	private undoStack = new UndoStack<InputState>();
 
 	getValue(): string {
@@ -49,34 +57,23 @@ export class Input implements Component, Focusable {
 	}
 
 	handleInput(data: string): void {
-		// Handle bracketed paste mode
-		// Start of paste: \x1b[200~
-		// End of paste: \x1b[201~
-
-		// Check if we're starting a bracketed paste
 		if (data.includes("\x1b[200~")) {
 			this.isInPaste = true;
 			this.pasteBuffer = "";
 			data = data.replace("\x1b[200~", "");
 		}
 
-		// If we're in a paste, buffer the data
 		if (this.isInPaste) {
-			// Check if this chunk contains the end marker
 			this.pasteBuffer += data;
 
 			const endIndex = this.pasteBuffer.indexOf("\x1b[201~");
 			if (endIndex !== -1) {
-				// Extract the pasted content
 				const pasteContent = this.pasteBuffer.substring(0, endIndex);
 
-				// Process the complete paste
 				this.handlePaste(pasteContent);
 
-				// Reset paste state
 				this.isInPaste = false;
 
-				// Handle any remaining input after the paste marker
 				const remaining = this.pasteBuffer.substring(endIndex + 6); // 6 = length of \x1b[201~
 				this.pasteBuffer = "";
 				if (remaining) {
@@ -88,25 +85,21 @@ export class Input implements Component, Focusable {
 
 		const kb = getKeybindings();
 
-		// Escape/Cancel
 		if (kb.matches(data, "tui.select.cancel")) {
 			if (this.onEscape) this.onEscape();
 			return;
 		}
 
-		// Undo
 		if (kb.matches(data, "tui.editor.undo")) {
 			this.undo();
 			return;
 		}
 
-		// Submit
 		if (kb.matches(data, "tui.input.submit") || data === "\n") {
 			if (this.onSubmit) this.onSubmit(this.value);
 			return;
 		}
 
-		// Deletion
 		if (kb.matches(data, "tui.editor.deleteCharBackward")) {
 			this.handleBackspace();
 			return;
@@ -137,7 +130,6 @@ export class Input implements Component, Focusable {
 			return;
 		}
 
-		// Kill ring actions
 		if (kb.matches(data, "tui.editor.yank")) {
 			this.yank();
 			return;
@@ -147,7 +139,6 @@ export class Input implements Component, Focusable {
 			return;
 		}
 
-		// Cursor movement
 		if (kb.matches(data, "tui.editor.cursorLeft")) {
 			this.lastAction = null;
 			if (this.cursor > 0) {
@@ -214,7 +205,6 @@ export class Input implements Component, Focusable {
 	}
 
 	private insertCharacter(char: string): void {
-		// Undo coalescing: consecutive word chars coalesce into one undo unit
 		if (isWhitespaceChar(char) || this.lastAction !== "type-word") {
 			this.pushUndo();
 		}
@@ -325,12 +315,10 @@ export class Input implements Component, Focusable {
 
 		this.pushUndo();
 
-		// Delete the previously yanked text (still at end of ring before rotation)
 		const prevText = this.killRing.peek() || "";
 		this.value = this.value.slice(0, this.cursor - prevText.length) + this.value.slice(this.cursor);
 		this.cursor -= prevText.length;
 
-		// Rotate and insert new entry
 		this.killRing.rotate();
 		const text = this.killRing.peek() || "";
 		this.value = this.value.slice(0, this.cursor) + text + this.value.slice(this.cursor);
@@ -359,7 +347,6 @@ export class Input implements Component, Focusable {
 		const textBeforeCursor = this.value.slice(0, this.cursor);
 		const graphemes = [...segmenter.segment(textBeforeCursor)];
 
-		// Skip trailing whitespace
 		while (graphemes.length > 0 && isWhitespaceChar(graphemes[graphemes.length - 1]?.segment || "")) {
 			this.cursor -= graphemes.pop()?.segment.length || 0;
 		}
@@ -367,12 +354,10 @@ export class Input implements Component, Focusable {
 		if (graphemes.length > 0) {
 			const lastGrapheme = graphemes[graphemes.length - 1]?.segment || "";
 			if (isPunctuationChar(lastGrapheme)) {
-				// Skip punctuation run
 				while (graphemes.length > 0 && isPunctuationChar(graphemes[graphemes.length - 1]?.segment || "")) {
 					this.cursor -= graphemes.pop()?.segment.length || 0;
 				}
 			} else {
-				// Skip word run
 				while (
 					graphemes.length > 0 &&
 					!isWhitespaceChar(graphemes[graphemes.length - 1]?.segment || "") &&
@@ -395,7 +380,6 @@ export class Input implements Component, Focusable {
 		const iterator = segments[Symbol.iterator]();
 		let next = iterator.next();
 
-		// Skip leading whitespace
 		while (!next.done && isWhitespaceChar(next.value.segment)) {
 			this.cursor += next.value.segment.length;
 			next = iterator.next();
@@ -404,13 +388,11 @@ export class Input implements Component, Focusable {
 		if (!next.done) {
 			const firstGrapheme = next.value.segment;
 			if (isPunctuationChar(firstGrapheme)) {
-				// Skip punctuation run
 				while (!next.done && isPunctuationChar(next.value.segment)) {
 					this.cursor += next.value.segment.length;
 					next = iterator.next();
 				}
 			} else {
-				// Skip word run
 				while (!next.done && !isWhitespaceChar(next.value.segment) && !isPunctuationChar(next.value.segment)) {
 					this.cursor += next.value.segment.length;
 					next = iterator.next();
@@ -423,20 +405,28 @@ export class Input implements Component, Focusable {
 		this.lastAction = null;
 		this.pushUndo();
 
-		// Clean the pasted text - remove newlines and carriage returns
 		const cleanText = pastedText.replace(/\r\n/g, "").replace(/\r/g, "").replace(/\n/g, "").replace(/\t/g, "    ");
 
-		// Insert at cursor position
 		this.value = this.value.slice(0, this.cursor) + cleanText + this.value.slice(this.cursor);
 		this.cursor += cleanText.length;
 	}
 
-	invalidate(): void {
-		// No cached state to invalidate currently
+	invalidate(): void {}
+
+	/**
+	 * The (value, cursor) pair rendering operates on. Unmasked input renders the
+	 * real buffer; masked input renders one bullet per grapheme with the cursor
+	 * mapped by grapheme count, so the displayed text never contains the secret
+	 * while the real buffer keeps every edit and submit.
+	 */
+	private displayState(): { value: string; cursor: number } {
+		if (this.options.masked !== true) return { value: this.value, cursor: this.cursor };
+		const graphemes = [...segmenter.segment(this.value)];
+		const beforeCursor = [...segmenter.segment(this.value.slice(0, this.cursor))];
+		return { value: graphemes.map(() => "•").join(""), cursor: beforeCursor.length };
 	}
 
 	render(width: number): string[] {
-		// Calculate visible window
 		const prompt = "> ";
 		const availableWidth = width - prompt.length;
 
@@ -444,36 +434,31 @@ export class Input implements Component, Focusable {
 			return [prompt];
 		}
 
+		const display = this.displayState();
 		let visibleText = "";
-		let cursorDisplay = this.cursor;
-		const totalWidth = visibleWidth(this.value);
+		let cursorDisplay = display.cursor;
+		const totalWidth = visibleWidth(display.value);
 
 		if (totalWidth < availableWidth) {
-			// Everything fits (leave room for cursor at end)
-			visibleText = this.value;
+			visibleText = display.value;
 		} else {
-			// Need horizontal scrolling
-			// Reserve one column for cursor if it's at the end
-			const scrollWidth = this.cursor === this.value.length ? availableWidth - 1 : availableWidth;
-			const cursorCol = visibleWidth(this.value.slice(0, this.cursor));
+			const scrollWidth = display.cursor === display.value.length ? availableWidth - 1 : availableWidth;
+			const cursorCol = visibleWidth(display.value.slice(0, display.cursor));
 
 			if (scrollWidth > 0) {
 				const halfWidth = Math.floor(scrollWidth / 2);
 				let startCol = 0;
 
 				if (cursorCol < halfWidth) {
-					// Cursor near start
 					startCol = 0;
 				} else if (cursorCol > totalWidth - halfWidth) {
-					// Cursor near end
 					startCol = Math.max(0, totalWidth - scrollWidth);
 				} else {
-					// Cursor in middle
 					startCol = Math.max(0, cursorCol - halfWidth);
 				}
 
-				visibleText = sliceByColumn(this.value, startCol, scrollWidth, true);
-				const beforeCursor = sliceByColumn(this.value, startCol, Math.max(0, cursorCol - startCol), true);
+				visibleText = sliceByColumn(display.value, startCol, scrollWidth, true);
+				const beforeCursor = sliceByColumn(display.value, startCol, Math.max(0, cursorCol - startCol), true);
 				cursorDisplay = beforeCursor.length;
 			} else {
 				visibleText = "";
@@ -481,8 +466,6 @@ export class Input implements Component, Focusable {
 			}
 		}
 
-		// Build line with fake cursor
-		// Insert cursor character at cursor position
 		const graphemes = [...segmenter.segment(visibleText.slice(cursorDisplay))];
 		const cursorGrapheme = graphemes[0];
 
@@ -493,11 +476,9 @@ export class Input implements Component, Focusable {
 		// Hardware cursor marker (zero-width, emitted before fake cursor for IME positioning)
 		const marker = this.focused ? CURSOR_MARKER : "";
 
-		// Use inverse video to show cursor
 		const cursorChar = `\x1b[7m${atCursor}\x1b[27m`; // ESC[7m = reverse video, ESC[27m = normal
 		const textWithCursor = beforeCursor + marker + cursorChar + afterCursor;
 
-		// Calculate visual width
 		const visualLength = visibleWidth(textWithCursor);
 		const padding = " ".repeat(Math.max(0, availableWidth - visualLength));
 		const line = prompt + textWithCursor + padding;

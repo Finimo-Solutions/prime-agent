@@ -1,6 +1,16 @@
-import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessage,
+	type AssistantMessageEvent,
+	EventStream,
+	type FauxProviderRegistration,
+	fauxAssistantMessage,
+	getModel,
+	registerFauxProvider,
+	type ToolResultMessage,
+	type UserMessage,
+} from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	Agent,
 	type AgentContext,
@@ -9,8 +19,8 @@ import {
 	type AgentTool,
 	agentLoop,
 } from "../src/index.js";
+import { calculateTool } from "./utils/calculate.js";
 
-// Mock stream that mimics AssistantMessageEventStream
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
 	constructor() {
 		super(
@@ -80,6 +90,23 @@ describe("Agent", () => {
 		expect(agent.state.errorMessage).toBeUndefined();
 	});
 
+	it("passes an explicit off reasoning selection to providers", async () => {
+		let reasoning: AgentLoopConfig["reasoning"];
+		const agent = new Agent({
+			streamFn: (_model, _context, options) => {
+				reasoning = options?.reasoning;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("ok") });
+				});
+				return stream;
+			},
+		});
+
+		await agent.prompt("hello");
+		expect(reasoning).toBe("off");
+	});
+
 	it("should create an agent instance with custom initial state", () => {
 		const customModel = getModel("openai", "gpt-4o-mini");
 		const agent = new Agent({
@@ -105,15 +132,12 @@ describe("Agent", () => {
 			eventCount++;
 		});
 
-		// No initial event on subscribe
 		expect(eventCount).toBe(0);
 
-		// State mutators don't emit events
 		agent.state.systemPrompt = "Test prompt";
 		expect(eventCount).toBe(0);
 		expect(agent.state.systemPrompt).toBe("Test prompt");
 
-		// Unsubscribe should work
 		unsubscribe();
 		agent.state.systemPrompt = "Another prompt";
 		expect(eventCount).toBe(0); // Should not increase
@@ -258,38 +282,31 @@ describe("Agent", () => {
 	it("should update state with mutators", () => {
 		const agent = new Agent();
 
-		// Test setSystemPrompt
 		agent.state.systemPrompt = "Custom prompt";
 		expect(agent.state.systemPrompt).toBe("Custom prompt");
 
-		// Test setModel
 		const newModel = getModel("google", "gemini-2.5-flash");
 		agent.state.model = newModel;
 		expect(agent.state.model).toBe(newModel);
 
-		// Test setThinkingLevel
 		agent.state.thinkingLevel = "high";
 		expect(agent.state.thinkingLevel).toBe("high");
 
-		// Test setTools
 		const tools = [{ name: "test", description: "test tool" } as any];
 		agent.state.tools = tools;
 		expect(agent.state.tools).toEqual(tools);
 		expect(agent.state.tools).not.toBe(tools); // Should be a copy
 
-		// Test replaceMessages
 		const messages = [{ role: "user" as const, content: "Hello", timestamp: Date.now() }];
 		agent.state.messages = messages;
 		expect(agent.state.messages).toEqual(messages);
 		expect(agent.state.messages).not.toBe(messages); // Should be a copy
 
-		// Test appendMessage
 		const newMessage = { role: "assistant" as const, content: [{ type: "text" as const, text: "Hi" }] };
 		agent.state.messages.push(newMessage as any);
 		expect(agent.state.messages).toHaveLength(2);
 		expect(agent.state.messages[1]).toBe(newMessage);
 
-		// Test clearMessages
 		agent.state.messages = [];
 		expect(agent.state.messages).toEqual([]);
 	});
@@ -300,7 +317,6 @@ describe("Agent", () => {
 		const message = { role: "user" as const, content: "Steering message", timestamp: Date.now() };
 		agent.steer(message);
 
-		// The message is queued but not yet in state.messages
 		expect(agent.state.messages).not.toContainEqual(message);
 	});
 
@@ -310,14 +326,12 @@ describe("Agent", () => {
 		const message = { role: "user" as const, content: "Follow-up message", timestamp: Date.now() };
 		agent.followUp(message);
 
-		// The message is queued but not yet in state.messages
 		expect(agent.state.messages).not.toContainEqual(message);
 	});
 
 	it("should handle abort controller", () => {
 		const agent = new Agent();
 
-		// Should not throw even if nothing is running
 		expect(() => agent.abort()).not.toThrow();
 	});
 
@@ -458,7 +472,6 @@ describe("Agent", () => {
 			controller.signal,
 		);
 		for await (const _event of stream) {
-			// Drain the stream.
 		}
 
 		expect(await stream.result()).toEqual([]);
@@ -492,13 +505,11 @@ describe("Agent", () => {
 	it("should throw when prompt() called while streaming", async () => {
 		let abortSignal: AbortSignal | undefined;
 		const agent = new Agent({
-			// Use a stream function that responds to abort
 			streamFn: (_model, _context, options) => {
 				abortSignal = options?.signal;
 				const stream = new MockAssistantStream();
 				queueMicrotask(() => {
 					stream.push({ type: "start", partial: createAssistantMessage("") });
-					// Check abort signal periodically
 					const checkAbort = () => {
 						if (abortSignal?.aborted) {
 							stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") });
@@ -512,19 +523,15 @@ describe("Agent", () => {
 			},
 		});
 
-		// Start first prompt (don't await, it will block until abort)
 		const firstPrompt = agent.prompt("First message");
 
-		// Wait a tick for isStreaming to be set
 		await new Promise((resolve) => setTimeout(resolve, 10));
 		expect(agent.state.isStreaming).toBe(true);
 
-		// Second prompt should reject
 		await expect(agent.prompt("Second message")).rejects.toThrow(
 			"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
 		);
 
-		// Cleanup - abort to stop the stream
 		agent.abort();
 		await firstPrompt.catch(() => {}); // Ignore abort error
 	});
@@ -550,17 +557,16 @@ describe("Agent", () => {
 			},
 		});
 
-		// Start first prompt
 		const firstPrompt = agent.prompt("First message");
 		await new Promise((resolve) => setTimeout(resolve, 10));
 		expect(agent.state.isStreaming).toBe(true);
 
-		// continue() should reject
-		await expect(agent.continue()).rejects.toThrow(
-			"Agent is already processing. Wait for completion before continuing.",
-		);
+		await expect(agent.continue()).rejects.toMatchObject({
+			name: "AgentContinueError",
+			code: "busy",
+			message: "Agent is already processing. Wait for completion before continuing.",
+		});
 
-		// Cleanup
 		agent.abort();
 		await firstPrompt.catch(() => {});
 	});
@@ -705,7 +711,6 @@ describe("Agent", () => {
 		await agent.prompt("hello");
 		expect(receivedSessionId).toBe("session-abc");
 
-		// Test setter
 		agent.sessionId = "session-def";
 		expect(agent.sessionId).toBe("session-def");
 
@@ -729,5 +734,147 @@ describe("Agent", () => {
 
 		await agent.prompt("hello");
 		expect(receivedServiceTier).toBe("priority");
+	});
+});
+
+describe("Agent integration with the faux provider", () => {
+	const registrations: FauxProviderRegistration[] = [];
+
+	function createFauxRegistration(options: Parameters<typeof registerFauxProvider>[0] = {}): FauxProviderRegistration {
+		const registration = registerFauxProvider(options);
+		registrations.push(registration);
+		return registration;
+	}
+
+	function textOf(message: AssistantMessage | ToolResultMessage): string {
+		return message.content
+			.filter((block) => block.type === "text")
+			.map((block) => block.text)
+			.join("\n");
+	}
+
+	afterEach(() => {
+		while (registrations.length > 0) registrations.pop()?.unregister();
+	});
+
+	it("streams a prompt through the provider to a settled assistant message", async () => {
+		const faux = createFauxRegistration();
+		faux.setResponses([fauxAssistantMessage("4")]);
+		const agent = new Agent({
+			initialState: {
+				systemPrompt: "Keep responses concise.",
+				model: faux.getModel(),
+				thinkingLevel: "off",
+				tools: [],
+			},
+		});
+
+		await agent.prompt("What is 2+2? Answer with just the number.");
+
+		expect(agent.state.isStreaming).toBe(false);
+		expect(agent.state.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+		const assistantMessage = agent.state.messages[1];
+		if (assistantMessage.role !== "assistant") throw new Error("Expected assistant message");
+		expect(textOf(assistantMessage)).toContain("4");
+	});
+
+	it("aborts mid-stream and records the aborted stop reason", async () => {
+		const faux = createFauxRegistration({ tokensPerSecond: 20, tokenSize: { min: 2, max: 2 } });
+		faux.setResponses([
+			fauxAssistantMessage(
+				"one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen",
+			),
+		]);
+		const agent = new Agent({
+			initialState: {
+				systemPrompt: "You are a helpful assistant.",
+				model: faux.getModel(),
+				thinkingLevel: "off",
+				tools: [],
+			},
+		});
+
+		let aborted = false;
+		agent.subscribe((event) => {
+			if (!aborted && event.type === "message_update" && event.message.role === "assistant") {
+				aborted = true;
+				agent.abort();
+			}
+		});
+		await agent.prompt("Count slowly from 1 to 20.");
+
+		expect(agent.state.isStreaming).toBe(false);
+		const lastMessage = agent.state.messages[agent.state.messages.length - 1];
+		if (lastMessage.role !== "assistant") throw new Error("Expected assistant message");
+		expect(lastMessage.stopReason).toBe("aborted");
+		expect(lastMessage.errorMessage).toBeDefined();
+		expect(agent.state.errorMessage).toBe(lastMessage.errorMessage);
+	});
+
+	it("continues from a restored tool result", async () => {
+		const faux = createFauxRegistration();
+		const model = faux.getModel();
+		faux.setResponses([fauxAssistantMessage("The answer is 8.")]);
+		const agent = new Agent({
+			initialState: {
+				systemPrompt: "State the answer after a calculation result.",
+				model,
+				thinkingLevel: "off",
+				tools: [calculateTool],
+			},
+		});
+		const usage = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		const userMessage: UserMessage = {
+			role: "user",
+			content: [{ type: "text", text: "What is 5 + 3?" }],
+			timestamp: Date.now(),
+		};
+		const assistantMessage: AssistantMessage = {
+			role: "assistant",
+			content: [
+				{ type: "text", text: "Let me calculate that." },
+				{ type: "toolCall", id: "calc-1", name: "calculate", arguments: { expression: "5 + 3" } },
+			],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage,
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		};
+		const toolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "calc-1",
+			toolName: "calculate",
+			content: [{ type: "text", text: "5 + 3 = 8" }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		agent.state.messages = [userMessage, assistantMessage, toolResult];
+
+		await agent.continue();
+
+		expect(agent.state.isStreaming).toBe(false);
+		expect(agent.state.messages.length).toBeGreaterThanOrEqual(4);
+		const lastMessage = agent.state.messages[agent.state.messages.length - 1];
+		if (lastMessage.role !== "assistant") throw new Error("Expected assistant message");
+		expect(textOf(lastMessage)).toContain("8");
+	});
+
+	it("refuses to continue without a continuable tail message", async () => {
+		const faux = createFauxRegistration();
+		const agent = new Agent({ initialState: { systemPrompt: "Test", model: faux.getModel() } });
+
+		await expect(agent.continue()).rejects.toMatchObject({
+			code: "nothing-to-continue",
+			message: "No messages to continue from",
+		});
 	});
 });

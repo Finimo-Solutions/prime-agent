@@ -1,4 +1,5 @@
 import { APP_NAME } from "../config.js";
+import { findSlashCommandSuggestion } from "../core/slash-commands.js";
 
 export interface CommandSpec {
 	path: readonly string[];
@@ -93,6 +94,32 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		options: ["--force  Skip confirmation and kill unresponsive processes", "--json   Print JSON"],
 	},
 	{
+		path: ["mcp"],
+		usage: "mcp <add|list|get|remove>",
+		summary: "Manage user MCP servers",
+	},
+	{
+		path: ["mcp", "add"],
+		usage: "mcp add <name> --url <url> [--bearer-token-env-var <env>|--oauth] [--force]",
+		summary: "Add an HTTP or stdio MCP server",
+		description: "For stdio, use: mcp add <name> [--cwd <dir>] [--env CHILD=SOURCE] -- <command> [args...]",
+	},
+	{
+		path: ["mcp", "list"],
+		usage: "mcp list",
+		summary: "List user MCP servers",
+	},
+	{
+		path: ["mcp", "get"],
+		usage: "mcp get <name>",
+		summary: "Show a user MCP server",
+	},
+	{
+		path: ["mcp", "remove"],
+		usage: "mcp remove <name>",
+		summary: "Remove a user MCP server",
+	},
+	{
 		path: ["package"],
 		usage: "package <install|remove|list|update>",
 		summary: "Manage capability packages",
@@ -122,8 +149,14 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 	},
 	{
 		path: ["update"],
-		usage: "update [--force]",
+		usage: "update [--force] [--rollback] [--nightly|--stable]",
 		summary: "Update Prime Agent",
+		options: [
+			"--force     Reinstall even if the current version is the latest on the channel",
+			"--rollback  Restore the previous compiled release",
+			"--nightly   Switch updates to the nightly channel (unreleased builds, may be broken)",
+			"--stable    Return updates to the stable channel",
+		],
 	},
 	{
 		path: ["model"],
@@ -186,7 +219,7 @@ const TOP_LEVEL_OPTION_GROUPS: ReadonlyArray<{ heading: string; options: readonl
 		heading: "Session options",
 		options: [
 			["-c, --continue", "Continue the previous session"],
-			["-r, --resume <path|id>", "Resume a saved session"],
+			["-r, --resume [path|id]", "Open the agents view, or resume a saved session"],
 			["--fork <path|id>", "Fork a saved session into a new session"],
 			["--session-dir <dir>", "Use a custom session directory"],
 			["--no-session", "Do not save the session"],
@@ -269,24 +302,14 @@ export function isHelpCommandRequest(path: readonly string[]): boolean {
 }
 
 export function findCommandSuggestion(input: string, candidates: readonly string[]): string | undefined {
-	let closest: { candidate: string; distance: number } | undefined;
-	for (const candidate of candidates) {
-		const distance = editDistance(input, candidate);
-		if (!closest || distance < closest.distance) {
-			closest = { candidate, distance };
-		}
-	}
-	if (!closest || closest.distance > Math.max(2, Math.floor(input.length / 3))) {
-		return undefined;
-	}
-	return closest.candidate;
+	return findSlashCommandSuggestion(input, candidates);
 }
 
 export function formatTopLevelHelp(): string {
 	const commands = COMMAND_SPECS.filter((spec) => spec.path.length === 1);
 	const commandWidth = Math.max(...commands.map((spec) => spec.path[0]!.length));
 	const options = TOP_LEVEL_OPTION_GROUPS.map((group) => formatOptionGroup(group.heading, group.options)).join("\n\n");
-	return `${APP_NAME} - AI coding assistant with an IPython tool
+	return `${APP_NAME} - AI coding assistant with a Python REPL tool
 
 Usage:
   ${APP_NAME} [options] [@files...] [message...]
@@ -331,22 +354,4 @@ export function formatCommandHelp(path: readonly string[]): string | undefined {
 		sections.push("", "Examples:", ...spec.examples.map((example) => `  ${APP_NAME} ${example}`));
 	}
 	return sections.join("\n");
-}
-
-function editDistance(left: string, right: string): number {
-	const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
-	for (let leftIndex = 1; leftIndex <= left.length; leftIndex++) {
-		let diagonal = previous[0]!;
-		previous[0] = leftIndex;
-		for (let rightIndex = 1; rightIndex <= right.length; rightIndex++) {
-			const above = previous[rightIndex]!;
-			previous[rightIndex] = Math.min(
-				previous[rightIndex]! + 1,
-				previous[rightIndex - 1]! + 1,
-				diagonal + (left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1),
-			);
-			diagonal = above;
-		}
-	}
-	return previous[right.length]!;
 }

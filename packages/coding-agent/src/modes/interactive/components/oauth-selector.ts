@@ -6,12 +6,14 @@ import {
 	getKeybindings,
 	Spacer,
 	TruncatedText,
+	truncateToWidth,
 } from "@earendil-works/pi-tui";
 import type { AuthStatus, AuthStorage } from "../../../core/auth-storage.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "../../../core/prime-inference-auth.js";
 import { theme } from "../theme/theme.js";
 import {
 	getMenuListLayout,
+	inlineMenuPanelTopRuleRows,
 	MenuList,
 	MenuPanel,
 	MenuRow,
@@ -36,6 +38,8 @@ export interface OAuthSelectorOptions extends MenuViewportProvider {
 	title?: string;
 	subtitle?: string;
 	searchPlaceholder?: string;
+	inline?: boolean;
+	emptyMessage?: string;
 }
 
 export function compareAuthSelectorProviders(a: AuthSelectorProvider, b: AuthSelectorProvider): number {
@@ -51,13 +55,10 @@ const PROVIDER_LIST_RESERVED_ROWS = 7;
 const TAB_BAR_RESERVED_ROWS = 2;
 const PROVIDER_SCROLL_INDICATOR_ROWS = 1;
 
-/**
- * Component that renders an auth provider selector
- */
 export class OAuthSelectorComponent extends Container implements Focusable {
 	private searchInput: MenuSearchInput;
 
-	// Focusable implementation - propagate to search input for IME cursor positioning
+	// Delegate focus to the search input so its IME cursor remains positioned correctly.
 	private _focused = false;
 	get focused(): boolean {
 		return this._focused;
@@ -88,7 +89,11 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		compactItemRows: 2,
 	});
 	private readonly viewport: MenuViewportProvider;
+	/** Rows the inline MenuPanel draws above its children (separator rule). */
+	private topRuleRows = 0;
 	private readonly getHeaderRows: () => number;
+	private readonly inline: boolean;
+	private readonly emptyMessage?: string;
 
 	constructor(
 		mode: "login" | "logout",
@@ -102,6 +107,8 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		super();
 
 		this.mode = mode;
+		this.inline = options.inline === true;
+		this.emptyMessage = options.emptyMessage;
 		this.authStorage = authStorage;
 		this.getAuthStatus = getAuthStatus ?? ((providerId) => this.authStorage.getAuthStatus(providerId));
 		this.viewport = options;
@@ -118,16 +125,20 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 				? options.initialCategory
 				: (this.categories[0] ?? "provider");
 
+		const panelTitle =
+			this.inline && options.header ? "" : (options.title ?? (mode === "login" ? "Providers" : "Saved Credentials"));
+		const panelSubtitle =
+			options.subtitle ??
+			(mode === "login" ? "Connect with a subscription or API key." : "Choose a credential to remove.");
 		const panel = new MenuPanel({
-			title: options.title ?? (mode === "login" ? "Providers" : "Saved Credentials"),
-			subtitle:
-				options.subtitle ??
-				(mode === "login" ? "Connect with a subscription or API key." : "Choose a credential to remove."),
+			title: panelTitle,
+			subtitle: panelSubtitle,
+			inline: this.inline,
 		});
 		this.addChild(panel);
 		if (options.header) {
 			panel.addChild(options.header);
-			panel.addChild(new Spacer(1));
+			if (!this.inline) panel.addChild(new Spacer(1));
 		}
 
 		if (this.categories.length > 1) {
@@ -136,7 +147,7 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 			panel.addChild(new Spacer(1));
 		}
 
-		this.searchInput = new MenuSearchInput(options.searchPlaceholder ?? "Search providers");
+		this.searchInput = new MenuSearchInput(options.searchPlaceholder ?? "Search providers", this.inline);
 		this.searchInput.onSubmit = () => {
 			const selectedProvider = this.filteredProviders[this.selectedIndex];
 			if (selectedProvider) {
@@ -144,13 +155,20 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 			}
 		};
 		panel.addChild(this.searchInput);
-		panel.addChild(new Spacer(1));
+		if (!this.inline) panel.addChild(new Spacer(1));
 
-		// Create list container
-		this.listContainer = new MenuList({ compact: () => this.listLayout.compact });
+		this.listContainer = new MenuList({ compact: () => this.listLayout.compact, inline: this.inline });
 		panel.addChild(this.listContainer);
+		// The inline panel opens with its separator rule unless the bordered
+		// search already leads it; budget whichever the panel decides.
+		this.topRuleRows = this.inline
+			? inlineMenuPanelTopRuleRows({
+					title: panelTitle,
+					subtitle: panelSubtitle,
+					children: panel.children,
+				})
+			: 0;
 
-		// Initial render
 		this.filterProviders("");
 	}
 
@@ -296,13 +314,18 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 			if (!provider) continue;
 
 			const isSelected = i === this.selectedIndex;
+			const authLabel = provider.authType === "oauth" ? "subscription" : "api key";
 
 			this.listContainer.addChild(
 				new MenuRow({
-					primary: provider.name,
-					secondary: provider.authType === "oauth" ? "subscription" : "api key",
-					meta: this.formatStatusIndicator(provider),
+					primary: this.inline ? `${provider.name} · ${authLabel}` : provider.name,
+					secondary: this.inline ? undefined : authLabel,
+					meta:
+						this.inline && !this.isProviderConfigured(provider) && !this.isProviderStale(provider)
+							? undefined
+							: this.formatStatusIndicator(provider),
 					selected: isSelected,
+					inline: this.inline,
 				}),
 			);
 		}
@@ -312,15 +335,19 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 			this.listContainer.addChild(new TruncatedText(scrollInfo, 1, 0));
 		}
 
-		// Show "no providers" if empty
 		if (this.filteredProviders.length === 0) {
 			const message =
 				this.allProviders.length === 0
-					? this.mode === "login"
-						? "No providers available"
-						: "No providers logged in. Use /login first."
+					? (this.emptyMessage ??
+						(this.mode === "login" ? "No providers available" : "No providers logged in. Use /login first."))
 					: "No matching providers";
 			this.listContainer.addChild(new TruncatedText(theme.fg("muted", message), 1, 0));
+		} else if (this.inline && this.getInlineDetailRows() > 0) {
+			const selected = this.filteredProviders[this.selectedIndex];
+			this.listContainer.addChild({
+				render: (width) => ["", truncateToWidth(` ${this.formatStatusIndicator(selected)}`, width)],
+				invalidate: () => {},
+			});
 		}
 	}
 
@@ -368,16 +395,20 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 
 	handleInput(keyData: string): void {
 		const kb = getKeybindings();
-		// Up arrow
 		if (kb.matches(keyData, "tui.select.up")) {
 			if (this.filteredProviders.length === 0) return;
 			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
 			this.updateList();
-		}
-		// Down arrow
-		else if (kb.matches(keyData, "tui.select.down")) {
+		} else if (kb.matches(keyData, "tui.select.down")) {
 			if (this.filteredProviders.length === 0) return;
 			this.selectedIndex = Math.min(this.filteredProviders.length - 1, this.selectedIndex + 1);
+			this.updateList();
+		} else if (kb.matches(keyData, "tui.select.pageUp") || kb.matches(keyData, "tui.select.pageDown")) {
+			const direction = kb.matches(keyData, "tui.select.pageUp") ? -1 : 1;
+			this.selectedIndex = Math.max(
+				0,
+				Math.min(this.filteredProviders.length - 1, this.selectedIndex + direction * this.listLayout.visibleItems),
+			);
 			this.updateList();
 		}
 		// Only steal left/right for tabs when the search field is empty, so cursor
@@ -394,27 +425,32 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 			kb.matches(keyData, "tui.editor.cursorRight")
 		) {
 			this.switchCategory(1);
-		}
-		// Enter
-		else if (kb.matches(keyData, "tui.select.confirm")) {
+		} else if (kb.matches(keyData, "tui.select.confirm")) {
 			const selectedProvider = this.filteredProviders[this.selectedIndex];
 			if (selectedProvider) {
 				this.onSelectCallback(selectedProvider);
 			}
-		}
-		// Escape or Ctrl+C
-		else if (kb.matches(keyData, "tui.select.cancel")) {
+		} else if (kb.matches(keyData, "tui.select.cancel")) {
 			this.onCancelCallback();
-		}
-		// Pass everything else to search input
-		else {
+		} else {
+			const previousQuery = this.searchInput.getValue();
 			this.searchInput.handleInput(keyData);
-			this.filterProviders(this.searchInput.getValue());
+			if (previousQuery !== this.searchInput.getValue()) this.filterProviders(this.searchInput.getValue());
 		}
 	}
 
 	private get reservedRows(): number {
-		return PROVIDER_LIST_RESERVED_ROWS + this.getHeaderRows() + (this.tabBar ? TAB_BAR_RESERVED_ROWS : 0);
+		return (
+			(this.inline ? 3 + this.getInlineDetailRows() : PROVIDER_LIST_RESERVED_ROWS) +
+			this.getHeaderRows() +
+			(this.tabBar ? TAB_BAR_RESERVED_ROWS : 0) +
+			this.topRuleRows
+		);
+	}
+
+	private getInlineDetailRows(): number {
+		const minimumRows = this.getHeaderRows() + (this.tabBar ? TAB_BAR_RESERVED_ROWS : 0) + 7;
+		return (this.viewport.getRows?.() ?? Number.POSITIVE_INFINITY) >= minimumRows ? 2 : 0;
 	}
 
 	private updateLayout(): void {
@@ -423,8 +459,9 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 			preferredVisibleItems: PREFERRED_VISIBLE_PROVIDERS,
 			totalItems: this.filteredProviders.length,
 			reservedRows: this.reservedRows,
-			comfortableItemRows: 3,
-			compactItemRows: 2,
+			comfortableItemRows: this.inline ? 1 : 3,
+			compactItemRows: this.inline ? undefined : 2,
+			comfortableListPaddingRows: this.inline ? 0 : undefined,
 			scrollIndicatorRows: PROVIDER_SCROLL_INDICATOR_ROWS,
 		});
 	}

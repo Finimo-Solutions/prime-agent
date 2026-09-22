@@ -30,7 +30,19 @@
 - If you create or modify a test file, you MUST run that test file and iterate until it passes.
 - When writing tests, run them, identify issues in either the test or implementation, and iterate until fixed.
 - For `packages/coding-agent/test/suite/`, use `test/suite/harness.ts` plus the faux provider. Do not use real provider APIs, real API keys, or paid tokens.
-- Put issue-specific regressions under `packages/coding-agent/test/suite/regressions/` and name them `<issue-number>-<short-slug>.test.ts`.
+## Testing Policy
+
+- `npm run check:test-policy` is required. Never weaken it or add a broad exclusion. A platform exception must use `// test-policy: allow <rule> -- <specific reason>` immediately above one expression, and CI must run that test on a supported platform.
+- A test must fail when the behavior it covers is broken. Temporarily revert or stub the production behavior to prove the failure. If the test still passes, delete it.
+- Test observable behavior at process boundaries, durable formats, concurrency/ordering, crash recovery, and load. Do not assert a mock's own return value, private implementation steps, or exact rendered copy unless that text is a protocol contract.
+- CI tests must be unconditional and self-contained. Do not use live provider APIs, real credentials, paid tokens, `.skip`, `.skipIf`, `.runIf`, `.todo`, `.only`, environment-gated early returns, or optional assertions. Put manual live-provider probes outside the CI test suite.
+- Never use runner retries or retry-to-green wrappers. Every failed attempt counts as a failure. Fix the race or delete the test.
+- Never use a fixed sleep, real-time delay, polling loop, or larger timeout as a readiness signal. Await a concrete event or deferred promise, use a fake clock, or expose the missing completion signal. A timer may only bound failure; it must not make the test pass.
+- Tests using subprocesses, sockets, concurrency, or shared process state must bind port `0`, use unique temporary paths, restore environment/cwd/globals/fake timers, and close every resource in `finally`.
+- Run every modified test file directly. For concurrency, process, timer, or ordering changes, also run the focused suite repeatedly with multiple shuffle seeds. Stop on the first failure; repeated runs are evidence, never retries.
+- A change may not add more lines of test than source. A test-only change must delete at least as many test lines as it adds.
+- Regressions go in the existing suite for the module that broke, with the issue number in the test name. Never create one file per issue. One test file per source module; repeated cases belong in an `it.each` table.
+- Deleting code deletes its tests. A flaky test is made deterministic or deleted, never skipped or retried.
 
 ## Daemon Protocol Changes
 
@@ -104,28 +116,23 @@ You, yourself, are often running into a tmux session, so be careful when killing
 
 ## Changelog
 
-Location: `packages/*/CHANGELOG.md` (each package has its own)
+Location: `packages/<pkg>/.changes/<slug>.md` (one fragment file per PR per touched package)
 
 ### Format
 
-A flat list of plain bullets under `## [Unreleased]`. No `### Added` / `### Changed` / `### Fixed` / `### Removed` subsections — just one bullet per change, written as a short sentence starting with a past-tense verb (Added, Changed, Fixed, Removed). Keep each bullet to one line; describe the user-visible change, not the implementation.
+Do NOT edit `packages/*/CHANGELOG.md` directly. Instead, add a fragment file `packages/<pkg>/.changes/<slug>.md` (slug = kebab-case, branch- or ticket-derived, e.g. `eng-1234-fix-resize.md`) containing exactly the bullet line(s) for the change. Bullets are plain `- ...` lines with no `### Added` / `### Changed` / `### Fixed` / `### Removed` subsections — one bullet per change, written as a short sentence starting with a past-tense verb (Added, Changed, Fixed, Removed). Keep each bullet to one line; describe the user-visible change, not the implementation. The release script folds fragments into the release section of CHANGELOG.md and deletes them.
 
-Example of a well-formed `[Unreleased]` section:
+Example fragment (`packages/coding-agent/.changes/eng-1234-effort-command.md`):
 
 ```markdown
-## [Unreleased]
-
 - Added `/effort` to set the reasoning level, with autocomplete for the levels the current model supports.
-- Changed `prime-agent` to open a new chat by default instead of resuming the previous session.
-- Fixed onboarding showing no models after entering a provider key.
-- Removed the interactive `!` / `!!` bash shortcuts; use IPython instead.
 ```
 
 ### Rules
 
-- Read the full `[Unreleased]` section first so you don't duplicate an existing bullet
-- New entries ALWAYS go under `## [Unreleased]`
-- NEVER modify already-released version sections (e.g., `## [0.2.1]`) — each is immutable once released
+- One fragment file per PR per touched package; a fragment may contain multiple bullets
+- NEVER modify already-released version sections in CHANGELOG.md (e.g., `## [0.2.1]`) — each is immutable once released
+- Purely internal changes may opt out via the `no-changelog` PR label
 
 ### Attribution
 
@@ -183,7 +190,7 @@ Create provider file exporting:
 ### 7. Documentation
 
 - `packages/ai/README.md`: Add to providers table, document options/auth, add env vars
-- `packages/ai/CHANGELOG.md`: Add entry under `## [Unreleased]`
+- `packages/ai/.changes/<slug>.md`: Add a changelog fragment (see Changelog above)
 
 ## Releasing
 
@@ -196,7 +203,7 @@ Create provider file exporting:
 
 ### Steps
 
-1. **Update CHANGELOGs**: Ensure all changes since last release are documented in the `[Unreleased]` section of each affected package's CHANGELOG.md
+1. **Check fragments**: Ensure all changes since last release have fragment files in `packages/<pkg>/.changes/`
 
 2. **Run release script**:
    ```bash
@@ -204,7 +211,7 @@ Create provider file exporting:
    npm run release:minor    # API breaking changes
    ```
 
-The script handles: version bump, CHANGELOG finalization, commit, tag, publish, and adding new `[Unreleased]` sections.
+The script handles: version bump, folding `.changes/` fragments into the release section, commit, tag, and publish.
 
 ## **CRITICAL** Git Rules for Parallel Agents **CRITICAL**
 
@@ -239,7 +246,7 @@ git status
 
 # 2. Add ONLY your specific files
 git add packages/ai/src/providers/transform-messages.ts
-git add packages/ai/CHANGELOG.md
+git add packages/ai/.changes/eng-1234-fix-resize.md
 
 # 3. Commit
 git commit -m "fix(ai): description"

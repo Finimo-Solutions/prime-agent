@@ -319,11 +319,15 @@ user sends another prompt ◄─────────────────
   ├─► session_before_compact (can cancel or customize)
   └─► session_compact
 
+/refine or auto-refine
+  ├─► session_before_refine (can skip or replace planning; rollbacks bypass it)
+  └─► refine_complete
+
 /tree navigation
   ├─► session_before_tree (can cancel or customize)
   └─► session_tree
 
-/model or Ctrl+P (model selection/cycling)
+/model or Alt+M (model selection/cycling)
   ├─► thinking_level_select (if model change changes/clamps thinking level)
   └─► model_select
 
@@ -429,6 +433,36 @@ pi.on("session_before_compact", async (event, ctx) => {
 pi.on("session_compact", async (event, ctx) => {
   // event.compactionEntry - the saved compaction
   // event.fromExtension - whether extension provided it
+});
+```
+
+#### session_before_refine / refine_complete
+
+Fired around continual-harness refinement (`/refine` and auto-refine). `session_before_refine` runs before the planning LLM call and can skip the round or replace the planner; rollback refinements bypass it. Proposal edits from extensions go through the same apply-time validation as built-in plans.
+
+```typescript
+pi.on("session_before_refine", async (event, ctx) => {
+  const { trigger, instructions, scope, planningState, history, conversationText } = event.preparation;
+  // trigger - "manual" (/refine) or "auto" (auto-refine)
+  // scope - "global" or "local" harness target
+
+  // Skip this refinement round:
+  return { skip: true };
+
+  // OR replace the built-in planner (e.g. with a cheaper model — see
+  // examples/extensions/custom-refinement.ts):
+  return {
+    proposal: {
+      summary: "...",
+      rationale: "...",
+      expectedOutcome: "...",
+      edits: [{ action: "create", kind: "memory", title: "...", content: "..." }],
+    },
+  };
+});
+
+pi.on("refine_complete", async (event, ctx) => {
+  // event.id, summary, appliedEdits, scope
 });
 ```
 
@@ -635,7 +669,7 @@ Header availability depends on provider and transport. Providers that abstract H
 
 #### model_select
 
-Fired when the model changes via `/model` command, model cycling (`Ctrl+P`), or session restore.
+Fired when the model changes via `/model` command, model cycling (`Alt+M`), or session restore.
 
 ```typescript
 pi.on("model_select", async (event, ctx) => {
@@ -968,6 +1002,20 @@ Returns Prime Agent's current system prompt string.
 pi.on("before_agent_start", (event, ctx) => {
   const prompt = ctx.getSystemPrompt();
   console.log(`System prompt length: ${prompt.length}`);
+});
+```
+
+### ctx.setTimeout() / ctx.setInterval()
+
+Host-owned timers for scheduling extension work. Unlike the raw globals, a throwing (or rejecting) callback is reported through the extension error boundary instead of crashing the process, and all pending timers are cancelled automatically when the extension host unloads (session dispose, reload, or replacement). Handles work with `ctx.clearTimeout()` / `ctx.clearInterval()`.
+
+Raw global `setTimeout`/`setInterval` are unsupported for scheduling extension work: an uncaught error in a global timer callback can kill the whole process (including daemon session workers), and nothing cancels them on unload.
+
+```typescript
+pi.on("session_start", (_event, ctx) => {
+  const timer = ctx.setInterval(() => pollSomething(), 2000);
+  // Optional: unload cancels it automatically, or clear it yourself:
+  // ctx.clearInterval(timer);
 });
 ```
 
@@ -1490,7 +1538,7 @@ const active = pi.getActiveTools();
 const all = pi.getAllTools();
 // [{
 //   name: "ipython",
-//   description: "Execute Python code in a persistent IPython kernel...",
+//   description: "Execute Python code in a persistent Python REPL...",
 //   parameters: ..., 
 //   sourceInfo: { path: "<builtin:ipython>", source: "builtin", scope: "temporary", origin: "top-level" }
 // }, ...]
@@ -1526,7 +1574,7 @@ if (model) {
 Get or set the thinking level. Level is clamped to model capabilities (non-reasoning models always use "off"). Changes emit `thinking_level_select`.
 
 ```typescript
-const current = pi.getThinkingLevel();  // "off" | "minimal" | "low" | "medium" | "high" | "xhigh"
+const current = pi.getThinkingLevel();  // "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
 pi.setThinkingLevel("high");
 ```
 
@@ -2153,7 +2201,7 @@ For more control (e.g., to distinguish timeout from user cancel), use `AbortSign
 
 ```typescript
 const controller = new AbortController();
-const timeoutId = setTimeout(() => controller.abort(), 5000);
+const timeoutId = ctx.setTimeout(() => controller.abort(), 5000);
 
 const confirmed = await ctx.ui.confirm(
   "Timed Confirmation",
@@ -2161,7 +2209,7 @@ const confirmed = await ctx.ui.confirm(
   { signal: controller.signal }
 );
 
-clearTimeout(timeoutId);
+ctx.clearTimeout(timeoutId);
 
 if (confirmed) {
   // User confirmed
@@ -2544,6 +2592,7 @@ All examples in [examples/extensions/](../examples/extensions/).
 | `file-trigger.ts` | File watcher triggers messages | `sendMessage` |
 | **Compaction & Sessions** |||
 | `custom-compaction.ts` | Custom compaction summary | `on("session_before_compact")` |
+| `custom-refinement.ts` | Custom /refine planning (cheaper model) | `on("session_before_refine")` |
 | `trigger-compact.ts` | Trigger compaction manually | `compact()` |
 | `git-checkpoint.ts` | Git stash on turns | `on("turn_start")`, `on("session_before_fork")`, `exec` |
 | `auto-commit-on-exit.ts` | Commit on shutdown | `on("session_shutdown")`, `exec` |

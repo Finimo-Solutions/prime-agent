@@ -7,9 +7,7 @@
  * - GitHub Copilot
  */
 
-// Anthropic
 export { anthropicOAuthProvider, loginAnthropic, refreshAnthropicToken } from "./anthropic.js";
-// GitHub Copilot
 export {
 	getGitHubCopilotBaseUrl,
 	githubCopilotOAuthProvider,
@@ -17,40 +15,31 @@ export {
 	normalizeDomain,
 	refreshGitHubCopilotToken,
 } from "./github-copilot.js";
-// OpenAI Codex (ChatGPT OAuth)
 export { loginOpenAICodex, openaiCodexOAuthProvider, refreshOpenAICodexToken } from "./openai-codex.js";
-
 export * from "./types.js";
-
-// ============================================================================
-// Provider Registry
-// ============================================================================
+export { getXaiSubscriptionModel, loginXai, refreshXaiToken, xaiOAuthProvider } from "./xai.js";
 
 import { anthropicOAuthProvider } from "./anthropic.js";
 import { githubCopilotOAuthProvider } from "./github-copilot.js";
 import { openaiCodexOAuthProvider } from "./openai-codex.js";
 import type { OAuthCredentials, OAuthProviderId, OAuthProviderInfo, OAuthProviderInterface } from "./types.js";
+import { xaiOAuthProvider } from "./xai.js";
 
 const BUILT_IN_OAUTH_PROVIDERS: OAuthProviderInterface[] = [
 	anthropicOAuthProvider,
 	githubCopilotOAuthProvider,
 	openaiCodexOAuthProvider,
+	xaiOAuthProvider,
 ];
 
 const oauthProviderRegistry = new Map<string, OAuthProviderInterface>(
 	BUILT_IN_OAUTH_PROVIDERS.map((provider) => [provider.id, provider]),
 );
 
-/**
- * Get an OAuth provider by ID
- */
 export function getOAuthProvider(id: OAuthProviderId): OAuthProviderInterface | undefined {
 	return oauthProviderRegistry.get(id);
 }
 
-/**
- * Register a custom OAuth provider
- */
 export function registerOAuthProvider(provider: OAuthProviderInterface): void {
 	oauthProviderRegistry.set(provider.id, provider);
 }
@@ -70,9 +59,6 @@ export function unregisterOAuthProvider(id: string): void {
 	oauthProviderRegistry.delete(id);
 }
 
-/**
- * Reset OAuth providers to built-ins.
- */
 export function resetOAuthProviders(): void {
 	oauthProviderRegistry.clear();
 	for (const provider of BUILT_IN_OAUTH_PROVIDERS) {
@@ -80,9 +66,6 @@ export function resetOAuthProviders(): void {
 	}
 }
 
-/**
- * Get all registered OAuth providers
- */
 export function getOAuthProviders(): OAuthProviderInterface[] {
 	return Array.from(oauthProviderRegistry.values());
 }
@@ -97,10 +80,6 @@ export function getOAuthProviderInfoList(): OAuthProviderInfo[] {
 		available: true,
 	}));
 }
-
-// ============================================================================
-// High-level API (uses provider registry)
-// ============================================================================
 
 /**
  * Refresh token for any OAuth provider.
@@ -138,7 +117,6 @@ export async function getOAuthApiKey(
 		return null;
 	}
 
-	// Refresh if expired
 	if (Date.now() >= creds.expires) {
 		try {
 			creds = await provider.refreshToken(creds);

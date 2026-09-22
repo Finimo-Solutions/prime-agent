@@ -8,6 +8,9 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import type { AppKeybinding, KeybindingsManager } from "../../../core/keybindings.js";
+import { ArgTokenHighlighter } from "./prompt-highlight.js";
+
+const COMMAND_TOKEN_PATTERN = /^(\s*)\/(\S+)/;
 
 export interface CustomEditorOptions extends EditorOptions {
 	placeholder?: string;
@@ -21,10 +24,10 @@ export interface CustomEditorOptions extends EditorOptions {
 export class CustomEditor extends Editor {
 	private keybindings: KeybindingsManager;
 	private defaultPromptPrefix: string;
-	private readonly configuredPaddingX: number;
 	private placeholder: string | undefined;
 	private readonly placeholderColor: (text: string) => string;
 	private readonly isArgumentCommand: (name: string) => boolean;
+	private readonly argTokenHighlighter = new ArgTokenHighlighter();
 	public actionHandlers: Map<AppKeybinding, () => void> = new Map();
 
 	// Special handlers that can be dynamically replaced
@@ -43,7 +46,6 @@ export class CustomEditor extends Editor {
 		super(tui, theme, { ...options, promptPrefix });
 		this.keybindings = keybindings;
 		this.defaultPromptPrefix = promptPrefix;
-		this.configuredPaddingX = options?.paddingX ?? 0;
 		this.placeholder = options?.placeholder;
 		this.placeholderColor = options?.placeholderColor ?? ((text) => text);
 		this.isArgumentCommand = options?.isArgumentCommand ?? (() => false);
@@ -69,13 +71,29 @@ export class CustomEditor extends Editor {
 		layoutLineIndex: number,
 		lineText: string,
 		cursorCol: number | undefined,
+		sourceLine?: number,
+		sourceStart?: number,
+	): string {
+		if (sourceLine === undefined || sourceStart === undefined || this.getBashPromptInfo(this.getLines()[0] ?? "")) {
+			return this.styleCommandToken(displayText, layoutLineIndex, lineText, cursorCol);
+		}
+		// Arg tokens are styled first; their spans start after the command token, so the command offsets stay valid.
+		const highlighted = this.argTokenHighlighter.highlightLine(displayText, lineText, sourceLine, sourceStart);
+		return this.styleCommandToken(highlighted, layoutLineIndex, lineText, cursorCol);
+	}
+
+	private styleCommandToken(
+		displayText: string,
+		layoutLineIndex: number,
+		lineText: string,
+		cursorCol: number | undefined,
 	): string {
 		const commandColor = this.commandColor;
 		if (!commandColor || layoutLineIndex !== 0) {
 			return displayText;
 		}
 
-		const match = /^(\s*)\/(\S+)/.exec(lineText);
+		const match = COMMAND_TOKEN_PATTERN.exec(lineText);
 		if (!match) {
 			return displayText;
 		}
@@ -122,7 +140,14 @@ export class CustomEditor extends Editor {
 		this.actionHandlers.set(action, handler);
 	}
 
+	protected override getContentLineOffset(): number {
+		return this.getHeaderLine?.() !== undefined ? 2 : 0;
+	}
+
 	override render(width: number): string[] {
+		const commandMatch = COMMAND_TOKEN_PATTERN.exec(this.getLines()[0] ?? "");
+		const isArgumentCommandLine = commandMatch !== null && this.isArgumentCommand(commandMatch[2]!);
+		this.argTokenHighlighter.reset(this.getLines(), isArgumentCommandLine);
 		let lines = super.render(width);
 		if (this.placeholder && this.getText().length === 0 && lines.length >= 2) {
 			lines = [lines[0]!, this.renderPlaceholderLine(width), ...lines.slice(2)];
@@ -198,9 +223,11 @@ export class CustomEditor extends Editor {
 			// Fall through to editor handling for delete-char-forward when not empty
 		}
 
-		// Check all other app actions
+		// Check all other app actions. A raw "\n" is Shift+Enter's newline in some
+		// terminals, so it goes to the editor even though it decodes as ctrl+j.
 		for (const [action, handler] of this.actionHandlers) {
 			if (
+				data !== "\n" &&
 				action !== "app.input.clear" &&
 				action !== "app.exit" &&
 				(action !== "app.shortcuts" || this.getText().length === 0) &&
@@ -218,7 +245,7 @@ export class CustomEditor extends Editor {
 			this.keybindings.matches(data, "tui.editor.cursorDown") &&
 			!this.isShowingAutocomplete() &&
 			!this.isHistoryNavigationActive() &&
-			this.isCursorOnLastVisualLine() &&
+			this.isCursorAtEnd() &&
 			this.onMoveBelowPrompt?.()
 		) {
 			return;
@@ -226,6 +253,12 @@ export class CustomEditor extends Editor {
 
 		// Pass to parent for editor handling
 		super.handleInput(data);
+	}
+
+	private isCursorAtEnd(): boolean {
+		const lines = this.getLines();
+		const cursor = this.getCursor();
+		return cursor.line === lines.length - 1 && cursor.col === (lines[cursor.line]?.length ?? 0);
 	}
 
 	private splitRepeatedKeybinding(data: string, keybinding: AppKeybinding): string[] | undefined {
@@ -253,7 +286,7 @@ export class CustomEditor extends Editor {
 
 	private getEffectivePaddingX(width: number): number {
 		const maxPadding = Math.max(0, Math.floor((width - 1) / 2));
-		const configuredPaddingX = Math.min(this.configuredPaddingX, maxPadding);
+		const configuredPaddingX = Math.min(this.getPaddingX(), maxPadding);
 		return this.backgroundColor !== undefined
 			? Math.min(Math.max(configuredPaddingX, 2), maxPadding)
 			: configuredPaddingX;

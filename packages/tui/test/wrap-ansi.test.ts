@@ -1,7 +1,16 @@
 import assert from "node:assert";
 import { performance } from "node:perf_hooks";
 import { describe, it } from "node:test";
-import { extractAnsiCode, sliceByColumn, stripAnsi, visibleWidth, wrapTextWithAnsi } from "../src/utils.js";
+import {
+	extractAnsiCode,
+	normalizeTerminalOutput,
+	sliceByColumn,
+	stripAnsi,
+	truncateToWidth,
+	visibleContentSpan,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "../src/utils.js";
 
 describe("wrapTextWithAnsi", () => {
 	describe("underline styling", () => {
@@ -13,10 +22,8 @@ describe("wrapTextWithAnsi", () => {
 
 			const wrapped = wrapTextWithAnsi(text, 40);
 
-			// First line should NOT contain underline code - it's just "read this thread"
 			assert.strictEqual(wrapped[0], "read this thread");
 
-			// Second line should start with underline, have URL content
 			assert.strictEqual(wrapped[1].startsWith(underlineOn), true);
 			assert.ok(wrapped[1].includes("https://"));
 		});
@@ -39,12 +46,9 @@ describe("wrapTextWithAnsi", () => {
 
 			const wrapped = wrapTextWithAnsi(text, 30);
 
-			// Middle lines (with underlined content) should end with underline-off, not full reset
-			// Line 1 and 2 contain underlined URL parts
 			for (let i = 1; i < wrapped.length - 1; i++) {
 				const line = wrapped[i];
 				if (line.includes(underlineOn)) {
-					// Should end with underline off, NOT full reset
 					assert.strictEqual(line.endsWith(underlineOff), true);
 					assert.strictEqual(line.endsWith("\x1b[0m"), false);
 				}
@@ -60,12 +64,10 @@ describe("wrapTextWithAnsi", () => {
 
 			const wrapped = wrapTextWithAnsi(text, 15);
 
-			// Each line should have background color
 			for (const line of wrapped) {
 				assert.ok(line.includes(bgBlue));
 			}
 
-			// Middle lines should NOT end with full reset (kills background for padding)
 			for (let i = 0; i < wrapped.length - 1; i++) {
 				assert.strictEqual(wrapped[i].endsWith("\x1b[0m"), false);
 			}
@@ -80,16 +82,13 @@ describe("wrapTextWithAnsi", () => {
 
 			const wrapped = wrapTextWithAnsi(text, 20);
 
-			// All lines should have background color 41 (either as \x1b[41m or combined like \x1b[4;41m)
 			for (const line of wrapped) {
 				const hasBgColor = line.includes("[41m") || line.includes(";41m") || line.includes("[41;");
 				assert.ok(hasBgColor);
 			}
 
-			// Lines with underlined content should use underline-off at end, not full reset
 			for (let i = 0; i < wrapped.length - 1; i++) {
 				const line = wrapped[i];
-				// If this line has underline on, it should end with underline off (not full reset)
 				if (
 					(line.includes("[4m") || line.includes("[4;") || line.includes(";4m")) &&
 					!line.includes(underlineOff)
@@ -139,12 +138,10 @@ describe("wrapTextWithAnsi", () => {
 
 			const wrapped = wrapTextWithAnsi(text, 10);
 
-			// Each continuation line should start with red code
 			for (let i = 1; i < wrapped.length; i++) {
 				assert.strictEqual(wrapped[i].startsWith(red), true);
 			}
 
-			// Middle lines should not end with full reset
 			for (let i = 0; i < wrapped.length - 1; i++) {
 				assert.strictEqual(wrapped[i].endsWith("\x1b[0m"), false);
 			}
@@ -154,17 +151,11 @@ describe("wrapTextWithAnsi", () => {
 
 describe("wrapTextWithAnsi with OSC 8 hyperlinks", () => {
 	it("re-emits OSC 8 open at the start of continuation lines", () => {
-		// A hyperlink whose text is long enough to wrap
 		const url = "https://example.com";
-		// OSC 8 open + text that is 10 visible chars + OSC 8 close
 		const input = `\x1b]8;;${url}\x1b\\0123456789\x1b]8;;\x1b\\`;
 		const lines = wrapTextWithAnsi(input, 6);
 
-		// Every line that contains visible text from inside the hyperlink
-		// should start with the OSC 8 open sequence (or be preceded by it).
 		for (const line of lines) {
-			// If the line has visible content it must begin with the OSC 8 re-open
-			// OR it is the line where the close appeared with no following content.
 			const stripped = line.replace(/\x1b\]8;;[^\x1b\x07]*\x1b\\/g, "").replace(/\x1b\[[0-9;]*m/g, "");
 			if (stripped.trim().length > 0) {
 				assert.ok(
@@ -182,7 +173,6 @@ describe("wrapTextWithAnsi with OSC 8 hyperlinks", () => {
 
 		for (let i = 0; i < lines.length - 1; i++) {
 			const line = lines[i];
-			// Every non-final line that is inside a hyperlink should end with the close
 			if (line.includes(`\x1b]8;;${url}\x1b\\`)) {
 				assert.ok(
 					line.endsWith("\x1b]8;;\x1b\\"),
@@ -212,8 +202,6 @@ describe("wrapTextWithAnsi with OSC 8 hyperlinks", () => {
 		const input = `before \x1b]8;;${url}\x1b\\link\x1b]8;;\x1b\\ after`;
 		const lines = wrapTextWithAnsi(input, 80);
 
-		// With width 80 everything fits on one line; there should be exactly one
-		// OSC 8 open and one OSC 8 close.
 		assert.strictEqual(lines.length, 1);
 		const openCount = (lines[0].match(/\x1b\]8;;https:[^\x1b]+\x1b\\/g) ?? []).length;
 		const closeCount = (lines[0].match(/\x1b\]8;;\x1b\\/g) ?? []).length;
@@ -311,4 +299,91 @@ describe("ANSI sequence scanning", () => {
 
 		assert.strictEqual(visibleWidth(text), visibleWidth("Punterminatedx"));
 	});
+});
+
+describe("truncateToWidth", () => {
+	const cases: Array<[name: string, actual: () => string, expected: string]> = [
+		["does not add ANSI resets to plain text", () => truncateToWidth("abcdef", 4, "…"), "abc…"],
+		["clips a wide ellipsis that does not fit", () => truncateToWidth("abcdef", 1, "🙂"), ""],
+		["keeps a wide ellipsis that exactly fits", () => truncateToWidth("abcdef", 2, "🙂"), "🙂"],
+		["returns text that already fits even if the ellipsis is wider", () => truncateToWidth("界", 2, "🙂"), "界"],
+		[
+			"keeps a contiguous prefix instead of resuming after a wide grapheme",
+			() => truncateToWidth("🙂\t界 \x1b_abc\x07", 7, "…", true),
+			"🙂\t… ",
+		],
+	];
+
+	for (const [name, actual, expected] of cases) {
+		it(name, () => {
+			assert.strictEqual(actual(), expected);
+		});
+	}
+
+	const widthCases: Array<[name: string, text: string, width: number, ellipsis: string]> = [
+		["stays within width for very large unicode input", "🙂界".repeat(100_000), 40, "…"],
+		["handles malformed ANSI escape prefixes without hanging", `abc\x1bnot-ansi ${"🙂".repeat(1000)}`, 20, "…"],
+		["preserves styling while staying within width", `\x1b[31m${"hello ".repeat(1000)}\x1b[0m`, 20, "…"],
+	];
+
+	for (const [name, text, width, ellipsis] of widthCases) {
+		it(name, () => {
+			const truncated = truncateToWidth(text, width, ellipsis);
+			assert.ok(visibleWidth(truncated) <= width, `width ${visibleWidth(truncated)} exceeds ${width}`);
+		});
+	}
+
+	it("pads truncated output to the requested width", () => {
+		assert.strictEqual(visibleWidth(truncateToWidth("🙂界🙂界🙂界", 8, "…", true)), 8);
+	});
+
+	it("resets styling at the end of truncated styled text", () => {
+		assert.ok(truncateToWidth(`\x1b[31m${"hello".repeat(100)}`, 10, "").endsWith("\x1b[0m"));
+		assert.ok(truncateToWidth(`\x1b[31m${"hello ".repeat(1000)}\x1b[0m`, 20, "…").endsWith("\x1b[0m…\x1b[0m"));
+	});
+});
+
+describe("visibleWidth of controls, tabs and wide clusters", () => {
+	for (const [text, width] of [
+		["", 0],
+		[" ~", 2],
+		["abc\n", 3],
+		["a\x1fb", 2],
+		["a\x7fb", 2],
+		["abc\t", 6],
+		["a界b", 4],
+		["\t\x1b[31m界\x1b[0m", 5],
+		["ำ", 1],
+		["ຳ", 1],
+		["กำ", 2],
+		["ກຳ", 2],
+	] as const) {
+		it(`measures ${JSON.stringify(text)} as ${width} columns`, () => {
+			assert.strictEqual(visibleWidth(text), width);
+		});
+	}
+
+	it("normalizes Thai and Lao AM vowels only for terminal output", () => {
+		assert.strictEqual(normalizeTerminalOutput("ำ"), "ํา");
+		assert.strictEqual(normalizeTerminalOutput("ຳ"), "ໍາ");
+		assert.strictEqual(visibleWidth(normalizeTerminalOutput("ำabc")), visibleWidth("ำabc"));
+	});
+});
+
+describe("visibleContentSpan", () => {
+	for (const [name, line, width, expected] of [
+		["surrounding and interior whitespace", "  alpha beta  ", 80, { from: 2, to: 12 }],
+		["ANSI styling and styled padding", "\x1b[48;5;236m  \x1b[1malpha\x1b[22m  \x1b[49m", 80, { from: 2, to: 7 }],
+		["a fully blank styled line", "\x1b[48;5;236m      \x1b[49m", 80, null],
+		["tabs", "\talpha\t", 80, { from: 3, to: 8 }],
+		["wide graphemes", " 界🙂 ", 80, { from: 1, to: 5 }],
+		["combining marks", " e\u0301 ", 80, { from: 1, to: 2 }],
+		["a span clipped to the requested width", "  alpha", 4, { from: 2, to: 4 }],
+		["a wide grapheme clipped to the requested width", "   界", 4, { from: 3, to: 4 }],
+		["a zero-width request", "alpha", 0, null],
+	] as const) {
+		it(`measures ${name}`, () => {
+			assert.deepStrictEqual(visibleContentSpan(line, width), expected);
+		});
+	}
 });

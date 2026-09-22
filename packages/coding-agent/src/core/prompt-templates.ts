@@ -26,6 +26,8 @@ export function parseCommandArgs(argsString: string): string[] {
 	const args: string[] = [];
 	let current = "";
 	let inQuote: string | null = null;
+	// An explicitly quoted token is an argument even when empty ("" or '').
+	let quoted = false;
 
 	for (let i = 0; i < argsString.length; i++) {
 		const char = argsString[i];
@@ -38,17 +40,19 @@ export function parseCommandArgs(argsString: string): string[] {
 			}
 		} else if (char === '"' || char === "'") {
 			inQuote = char;
+			quoted = true;
 		} else if (/[\t\p{Zs}]/u.test(char)) {
-			if (current) {
+			if (current || quoted) {
 				args.push(current);
 				current = "";
+				quoted = false;
 			}
 		} else {
 			current += char;
 		}
 	}
 
-	if (current) {
+	if (current || quoted) {
 		args.push(current);
 	}
 
@@ -67,39 +71,22 @@ export function parseCommandArgs(argsString: string): string[] {
  * containing patterns like $1, $@, or $ARGUMENTS are NOT recursively substituted.
  */
 export function substituteArgs(content: string, args: string[]): string {
-	let result = content;
-
-	// Replace $1, $2, etc. with positional args FIRST (before wildcards)
-	// This prevents wildcard replacement values containing $<digit> patterns from being re-substituted
-	result = result.replace(/\$(\d+)/g, (_, num) => {
-		const index = parseInt(num, 10) - 1;
-		return args[index] ?? "";
-	});
-
-	// Replace ${@:start} or ${@:start:length} with sliced args (bash-style)
-	// Process BEFORE simple $@ to avoid conflicts
-	result = result.replace(/\$\{@:(\d+)(?::(\d+))?\}/g, (_, startStr, lengthStr) => {
-		let start = parseInt(startStr, 10) - 1; // Convert to 0-indexed (user provides 1-indexed)
-		// Treat 0 as 1 (bash convention: args start at 1)
-		if (start < 0) start = 0;
-
-		if (lengthStr) {
-			const length = parseInt(lengthStr, 10);
-			return args.slice(start, start + length).join(" ");
-		}
-		return args.slice(start).join(" ");
-	});
-
-	// Pre-compute all args joined (optimization)
 	const allArgs = args.join(" ");
-
-	// Replace $ARGUMENTS with all args joined (new syntax, aligns with Claude, Codex, OpenCode)
-	result = result.replace(/\$ARGUMENTS/g, allArgs);
-
-	// Replace $@ with all args joined (existing syntax)
-	result = result.replace(/\$@/g, allArgs);
-
-	return result;
+	return content.replace(
+		/\$(?:(\d+)|\{@:(\d+)(?::(\d+))?\}|ARGUMENTS|@)/g,
+		(_, num: string | undefined, startStr: string | undefined, lengthStr: string | undefined) => {
+			if (num !== undefined) {
+				return args[parseInt(num, 10) - 1] ?? "";
+			}
+			if (startStr !== undefined) {
+				// Slices are 1-indexed; zero also starts at the first argument.
+				const start = Math.max(0, parseInt(startStr, 10) - 1);
+				const end = lengthStr !== undefined ? start + parseInt(lengthStr, 10) : undefined;
+				return args.slice(start, end).join(" ");
+			}
+			return allArgs;
+		},
+	);
 }
 
 function loadTemplateFromFile(filePath: string, sourceInfo: SourceInfo): PromptTemplate | null {

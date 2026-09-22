@@ -32,6 +32,7 @@ export type {
 export { DaemonAgentConnection, InProcessAgentConnection } from "./agent-connection/index.js";
 export { type AgentsViewModeOptions, runAgentsViewMode } from "./agents-view/agents-view-mode.js";
 export {
+	type AgentsViewRecursiveRollup,
 	type AgentsViewRow,
 	type AgentsViewScopeFrame,
 	type AgentsViewScopeKey,
@@ -41,6 +42,7 @@ export {
 	buildAgentsViewRows,
 	buildUnifiedSessionIndex,
 	classifyAgentsViewSession,
+	computeRecursiveRollups,
 	createUnattachableChildOpenResult,
 	filterUnifiedSessions,
 	formatHeartbeatBadge,
@@ -48,6 +50,7 @@ export {
 	getAgentsViewSessionTitle,
 	getUnifiedSessionAncestorSessionIds,
 	hasUnifiedSessionChildren,
+	isEmptyAgentsViewSession,
 	reconcileUnifiedSessions,
 	resolveAgentsViewLeftResult,
 	resolveAgentsViewScopeFrames,
@@ -97,7 +100,7 @@ export {
 } from "./daemon/daemon-protocol.js";
 export type { SessionActivity, SessionLifecycle, SessionSummary } from "./daemon/daemon-session-list.js";
 export { resolveAttachModelFallbackMessage } from "./daemon/daemon-session-list.js";
-export { defaultDaemonSocketPath } from "./daemon/daemon-socket.js";
+export { defaultDaemonSocketPath, normalizeSocketPath } from "./daemon/daemon-socket.js";
 export { runDaemonSupervisorMode } from "./daemon/daemon-supervisor.js";
 export {
 	type InteractiveInitialPrompt,

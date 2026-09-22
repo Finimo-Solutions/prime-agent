@@ -27,7 +27,9 @@ afterEach(async () => {
 		await new Promise<void>((done) => server.close(() => done()));
 	}
 	for (const dir of tempDirs.splice(0)) {
-		rmSync(dir, { recursive: true, force: true });
+		// The CLI's daemon/kernel children may still be flushing caches under this
+		// dir when the child exits; retry the ENOTEMPTY/EBUSY window instead of failing cleanup.
+		rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 	}
 });
 
@@ -56,6 +58,9 @@ async function driveAcpTurn(baseUrl: string): Promise<AcpResult> {
 	const projectDir = join(tempRoot, "project");
 	mkdirSync(agentDir, { recursive: true });
 	mkdirSync(projectDir, { recursive: true });
+	// One deterministic failed attempt: the session-layer auto-retry would
+	// otherwise re-issue the rejected request before reporting the failure.
+	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ retry: { enabled: false } }), "utf-8");
 	writeFileSync(
 		join(agentDir, "models.json"),
 		JSON.stringify({
@@ -83,6 +88,7 @@ async function driveAcpTurn(baseUrl: string): Promise<AcpResult> {
 			"--model",
 			"cold/test-model",
 			"--no-session",
+			"--no-tools",
 			"--offline",
 			"--daemon-socket",
 			join(tempRoot, "d.sock"),
@@ -186,33 +192,32 @@ async function driveAcpTurn(baseUrl: string): Promise<AcpResult> {
 }
 
 describe("ACP mode over a cold real CLI process", () => {
-	it(
-		"reports a provider failure instead of a silent end_turn",
-		{ tags: ["kernel-heavy"], timeout: 180_000 },
-		async () => {
-			const baseUrl = await startRejectingProvider();
-			const { responses, updates } = await driveAcpTurn(baseUrl);
+	it("reports a provider failure instead of a silent end_turn", {
+		tags: ["kernel-heavy"],
+		timeout: 180_000,
+	}, async () => {
+		const baseUrl = await startRejectingProvider();
+		const { responses, updates } = await driveAcpTurn(baseUrl);
 
-			const initialize = responses.find((frame) => frame.id === 1);
-			expect(initialize, "the real CLI must answer initialize on stdout").toBeDefined();
+		const initialize = responses.find((frame) => frame.id === 1);
+		expect(initialize, "the real CLI must answer initialize on stdout").toBeDefined();
 
-			const prompt = responses.find((frame) => frame.id === 3);
-			expect(prompt, "session/prompt must answer").toBeDefined();
+		const prompt = responses.find((frame) => frame.id === 3);
+		expect(prompt, "session/prompt must answer").toBeDefined();
 
-			// The provider rejected, so the turn must not claim a clean completion.
-			// Before this was fixed the answer was {stopReason: "end_turn"} with
-			// updates === 0, which a client reads as a successful empty turn.
-			const result = (prompt as { result?: { stopReason?: string } }).result;
-			const error = (prompt as { error?: unknown }).error;
-			expect(
-				error !== undefined || result?.stopReason !== "end_turn",
-				`a failed turn must not report end_turn (updates=${updates}, frame=${JSON.stringify(prompt)})`,
-			).toBe(true);
+		// The provider rejected, so the turn must not claim a clean completion.
+		// Before this was fixed the answer was {stopReason: "end_turn"} with
+		// updates === 0, which a client reads as a successful empty turn.
+		const result = (prompt as { result?: { stopReason?: string } }).result;
+		const error = (prompt as { error?: unknown }).error;
+		expect(
+			error !== undefined || result?.stopReason !== "end_turn",
+			`a failed turn must not report end_turn (updates=${updates}, frame=${JSON.stringify(prompt)})`,
+		).toBe(true);
 
-			// Failing loudly is only half of it: the client also has to be able to
-			// tell *why*. Assert the provider's own rejection reaches the client
-			// rather than a bare "Internal error".
-			expect(JSON.stringify(error)).toContain("unauthorized in test");
-		},
-	);
+		// Failing loudly is only half of it: the client also has to be able to
+		// tell *why*. Assert the provider's own rejection reaches the client
+		// rather than a bare "Internal error".
+		expect(JSON.stringify(error)).toContain("unauthorized in test");
+	});
 });

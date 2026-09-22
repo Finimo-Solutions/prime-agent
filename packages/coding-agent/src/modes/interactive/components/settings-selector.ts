@@ -11,7 +11,7 @@ import {
 	Text,
 } from "@earendil-works/pi-tui";
 import type { IdleEvictionMinutes } from "../../../core/session-action-store.js";
-import type { WarningSettings } from "../../../core/settings-manager.js";
+import type { MermaidRenderingMode, WarningSettings } from "../../../core/settings-manager.js";
 import { getSelectListTheme, getSettingsListTheme, theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 
@@ -45,7 +45,7 @@ export interface SettingsConfig {
 	availableThinkingLevels: ThinkingLevel[];
 	currentTheme: string;
 	availableThemes: string[];
-	hideThinkingBlock: boolean;
+	mermaidRenderingMode: MermaidRenderingMode;
 	treeFilterMode: "default" | "no-tools" | "user-only" | "labeled-only" | "all";
 	showHardwareCursor: boolean;
 	editorPaddingX: number;
@@ -71,7 +71,7 @@ export interface SettingsCallbacks {
 	onThinkingLevelChange: (level: ThinkingLevel) => void;
 	onThemeChange: (theme: string) => void;
 	onThemePreview?: (theme: string) => void;
-	onHideThinkingBlockChange: (hidden: boolean) => void;
+	onMermaidRenderingModeChange: (mode: MermaidRenderingMode) => void;
 	onTreeFilterModeChange: (mode: "default" | "no-tools" | "user-only" | "labeled-only" | "all") => void;
 	onShowHardwareCursorChange: (enabled: boolean) => void;
 	onEditorPaddingXChange: (padding: number) => void;
@@ -84,9 +84,6 @@ export interface SettingsCallbacks {
 	onCancel: () => void;
 }
 
-/**
- * A submenu component for selecting from a list of options.
- */
 class WarningSettingsSubmenu extends Container {
 	private settingsList: SettingsList;
 	private state: WarningSettings;
@@ -143,19 +140,15 @@ class SelectSubmenu extends Container {
 	) {
 		super();
 
-		// Title
-		this.addChild(new Text(theme.bold(theme.fg("accent", title)), 0, 0));
+		this.addChild(new Text(theme.fg("accent", title), 0, 0));
 
-		// Description
 		if (description) {
 			this.addChild(new Spacer(1));
 			this.addChild(new Text(theme.fg("muted", description), 0, 0));
 		}
 
-		// Spacer
 		this.addChild(new Spacer(1));
 
-		// Select list
 		this.selectList = new SelectList(
 			options,
 			Math.min(options.length, 10),
@@ -163,7 +156,6 @@ class SelectSubmenu extends Container {
 			SETTINGS_SUBMENU_SELECT_LIST_LAYOUT,
 		);
 
-		// Pre-select current value
 		const currentIndex = options.findIndex((o) => o.value === currentValue);
 		if (currentIndex !== -1) {
 			this.selectList.setSelectedIndex(currentIndex);
@@ -183,7 +175,6 @@ class SelectSubmenu extends Container {
 
 		this.addChild(this.selectList);
 
-		// Hint
 		this.addChild(new Spacer(1));
 		this.addChild(new Text(theme.fg("dim", "  Enter to select · esc to go back"), 0, 0));
 	}
@@ -193,9 +184,6 @@ class SelectSubmenu extends Container {
 	}
 }
 
-/**
- * Main settings selector component.
- */
 export class SettingsSelectorComponent extends Container {
 	private settingsList: SettingsList;
 
@@ -248,11 +236,11 @@ export class SettingsSelectorComponent extends Container {
 				values: ["sse", "websocket", "websocket-cached", "auto"],
 			},
 			{
-				id: "hide-thinking",
-				label: "Hide thinking",
-				description: "Hide thinking blocks in assistant responses",
-				currentValue: config.hideThinkingBlock ? "true" : "false",
-				values: ["true", "false"],
+				id: "mermaid-rendering",
+				label: "Mermaid diagrams",
+				description: "Render Mermaid code blocks as Unicode diagrams",
+				currentValue: config.mermaidRenderingMode,
+				values: ["off", "final", "streaming"],
 			},
 			{
 				id: "quiet-startup",
@@ -443,7 +431,6 @@ export class SettingsSelectorComponent extends Container {
 			values: ["true", "false"],
 		});
 
-		// Add borders
 		this.addChild(new DynamicBorder());
 
 		this.settingsList = new SettingsList(
@@ -482,8 +469,8 @@ export class SettingsSelectorComponent extends Container {
 					case "transport":
 						callbacks.onTransportChange(newValue as Transport);
 						break;
-					case "hide-thinking":
-						callbacks.onHideThinkingBlockChange(newValue === "true");
+					case "mermaid-rendering":
+						callbacks.onMermaidRenderingModeChange(newValue as MermaidRenderingMode);
 						break;
 					case "quiet-startup":
 						callbacks.onQuietStartupChange(newValue === "true");

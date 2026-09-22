@@ -29,6 +29,7 @@ function couldBeEmoji(segment: string): boolean {
 }
 
 // Regexes for character classification (same as string-width library)
+const nonPrintableAsciiRegex = /[^\x20-\x7e]/;
 const zeroWidthRegex = /^(?:\p{Default_Ignorable_Code_Point}|\p{Control}|\p{Mark}|\p{Surrogate})+$/v;
 const leadingNonPrintingRegex = /^[\p{Default_Ignorable_Code_Point}\p{Control}\p{Format}\p{Mark}\p{Surrogate}]+/v;
 const rgiEmojiRegex = /^\p{RGI_Emoji}$/v;
@@ -38,13 +39,7 @@ const WIDTH_CACHE_SIZE = 512;
 const widthCache = new Map<string, number>();
 
 function isPrintableAscii(str: string): boolean {
-	for (let i = 0; i < str.length; i++) {
-		const code = str.charCodeAt(i);
-		if (code < 0x20 || code > 0x7e) {
-			return false;
-		}
-	}
-	return true;
+	return !nonPrintableAsciiRegex.test(str);
 }
 
 function truncateFragmentToWidth(text: string, maxWidth: number): { text: string; width: number } {
@@ -1237,6 +1232,66 @@ export function sliceWithWidth(
 		if (currentCol >= endCol) break;
 	}
 	return { text: result, width: resultWidth };
+}
+
+/**
+ * Return the OSC 8 hyperlink URL covering the given visible column, or null
+ * when the column is not inside a hyperlink (or is past the end of the line).
+ */
+export function hyperlinkAtColumn(line: string, column: number): string | null {
+	if (column < 0) return null;
+	const extractAnsi = createAnsiCodeExtractor(line);
+	let currentCol = 0;
+	let activeUrl: string | null = null;
+	let i = 0;
+	while (i < line.length) {
+		const ansi = extractAnsi(i);
+		if (ansi) {
+			const hyperlink = parseOsc8Hyperlink(ansi.code);
+			if (hyperlink !== undefined) activeUrl = hyperlink?.url ?? null;
+			i += ansi.length;
+			continue;
+		}
+		let textEnd = i;
+		while (textEnd < line.length && !extractAnsi(textEnd)) textEnd++;
+		for (const { segment } of segmenter.segment(line.slice(i, textEnd))) {
+			const w = graphemeWidth(segment);
+			if (column < currentCol + w) return activeUrl;
+			currentCol += w;
+		}
+		i = textEnd;
+	}
+	return null;
+}
+
+/**
+ * Return an explicit OSC 8 URL or terminal-style bare HTTP(S) URL covering a
+ * visible column. OSC 8 remains authoritative when its label resembles a URL.
+ */
+export function urlAtColumn(line: string, column: number): string | null {
+	const explicitUrl = hyperlinkAtColumn(line, column);
+	if (explicitUrl || column < 0) return explicitUrl;
+
+	// Fullscreen normalizes tabs before painting, and strips ANSI without
+	// changing visible columns. Mirror that representation for bare URL spans.
+	const plainText = stripAnsi(line).replace(/\t/g, "   ");
+	const urlPattern = /https?:\/\/[^\s<>"'`]+/giu;
+	for (const match of plainText.matchAll(urlPattern)) {
+		let url = match[0].replace(/[.,;:!?]+$/u, "");
+		for (const [open, close] of [
+			["(", ")"],
+			["[", "]"],
+			["{", "}"],
+		] as const) {
+			while (url.endsWith(close) && url.split(close).length > url.split(open).length) {
+				url = url.slice(0, -1);
+			}
+		}
+		const start = visibleWidth(plainText.slice(0, match.index));
+		const end = start + visibleWidth(url);
+		if (column >= start && column < end) return url;
+	}
+	return null;
 }
 
 // Pooled tracker instance for extractSegments (avoids allocation per call)

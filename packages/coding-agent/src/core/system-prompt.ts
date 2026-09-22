@@ -3,7 +3,7 @@
  */
 
 import { buildChildAgentDoctrine, buildRlmPrompt, buildSubagentGuidance } from "./prompts/index.js";
-import { formatHarnessStateForPrompt, type HarnessState, REFINE_SKILL_NAME } from "./refinement/index.js";
+import { REFINE_SKILL_NAME } from "./refinement/index.js";
 import { formatSkillsForPrompt, getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
 
 export interface BuildSystemPromptOptions {
@@ -31,8 +31,8 @@ export interface BuildSystemPromptOptions {
 	rlmDepth?: number;
 	/** Human-readable parent name or id for child communication doctrine. */
 	rlmParentAgent?: string;
-	/** Global harness state to inject as compact persistent context. */
-	harnessState?: HarnessState;
+	/** Enabled user-configured servers available through the generic kernel MCP API. */
+	genericMcpServers?: string[];
 }
 
 /** Build the system prompt with tools, guidelines, and context */
@@ -47,7 +47,6 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		contextFiles: providedContextFiles,
 		skills: providedSkills,
 		allowRecursion,
-		harnessState,
 	} = options;
 	const promptCwd = cwd.replace(/\\/g, "/");
 	const promptMessagesPath = (messagesPath ?? "not persisted").replace(/\\/g, "/");
@@ -64,10 +63,10 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	const skills = providedSkills ?? [];
 	const tools = selectedTools ?? ["ipython"];
 	const hasIpython = tools.includes("ipython");
-	const hasBash = tools.includes("bash");
 	const visibleSkills = skills.filter((skill) => !skill.disableModelInvocation);
 	const visiblePythonSkillImportNames = getPythonSkillRuntimeInfo(visibleSkills).map((skill) => skill.importName);
 	const hasRefineSkill = visibleSkills.some((skill) => skill.name === REFINE_SKILL_NAME);
+	const genericMcpSection = hasIpython ? formatGenericMcpGuidance(options.genericMcpServers) : "";
 
 	if (customPrompt) {
 		let prompt = customPrompt;
@@ -102,8 +101,8 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 			prompt += `\n\n${childDoctrine}`;
 		}
 
-		if (harnessState) {
-			prompt += `\n\n${formatHarnessStateForPrompt(harnessState, { includeIpythonExamples: hasIpython, includeShellExamples: hasBash, includeRefineExamples: hasIpython && hasRefineSkill })}`;
+		if (genericMcpSection) {
+			prompt += `\n\n${genericMcpSection}`;
 		}
 
 		if (appendSection) {
@@ -123,9 +122,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		parentAgent: options.rlmParentAgent,
 	});
 
-	// Appended AFTER the trained buildRlmPrompt prefix, and before the harness-state
-	// menu, so the model reads when/why to delegate and then sees the concrete subagent
-	// specs it can match against — the same ordering as Claude Code's Agent tool.
+	// Appended AFTER the trained buildRlmPrompt prefix: delegation doctrine precedes the subagent specs delivered via the harness digest.
 	if ((allowRecursion ?? true) && hasIpython) {
 		const visiblePythonSkillNames = new Set(
 			getPythonSkillRuntimeInfo(visibleSkills).map((skill) => skill.importName),
@@ -137,8 +134,8 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		})}`;
 	}
 
-	if (harnessState) {
-		prompt += `\n\n${formatHarnessStateForPrompt(harnessState, { includeIpythonExamples: hasIpython, includeShellExamples: hasBash, includeRefineExamples: hasIpython && hasRefineSkill })}`;
+	if (genericMcpSection) {
+		prompt += `\n\n${genericMcpSection}`;
 	}
 
 	const guidelines = formatPromptGuidelines(promptGuidelines);
@@ -166,6 +163,22 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	}
 
 	return prompt;
+}
+
+function formatGenericMcpGuidance(servers: string[] | undefined): string {
+	const enabledServers = [...new Set(servers ?? [])].sort((left, right) => left.localeCompare(right));
+	if (enabledServers.length === 0) return "";
+
+	return [
+		"# Generic MCP Connections",
+		"",
+		"Generic MCP connections are accessed through the pre-imported Python `mcp` object in the Python REPL, not as top-level native tool namespaces or installed Python skills.",
+		`Enabled generic MCP servers: ${enabledServers.map((server) => `\`${server}\``).join(", ")}.`,
+		...enabledServers.map(
+			(server) =>
+				`For \`${server}\`, first discover its tools with \`await mcp.list_tools("${server}")\`, then call one with \`await mcp.call_tool("${server}", "<tool>", arguments)\`.`,
+		),
+	].join("\n");
 }
 
 function formatPromptGuidelines(promptGuidelines: string[] | undefined): string {

@@ -3,10 +3,9 @@
  * Used by auth-storage.ts and model-registry.ts.
  */
 
-import { execSync, spawnSync } from "child_process";
+import { execSyncHidden, spawnSyncHidden } from "../utils/child-process.js";
 import { getShellConfig } from "../utils/shell.js";
 
-// Cache for shell command results (persists for process lifetime)
 const commandResultCache = new Map<string, string | undefined>();
 
 /**
@@ -18,19 +17,26 @@ export function resolveConfigValue(config: string): string | undefined {
 	if (config.startsWith("!")) {
 		return executeCommand(config);
 	}
+	return resolveEnvOrLiteral(config);
+}
+
+/** Unset env var: fall back to the literal string. Set-but-empty: missing credential, never the var name. */
+function resolveEnvOrLiteral(config: string): string | undefined {
 	const envValue = process.env[config];
-	return envValue || config;
+	if (envValue !== undefined) {
+		return envValue || undefined;
+	}
+	return config;
 }
 
 function executeWithConfiguredShell(command: string): { executed: boolean; value: string | undefined } {
 	try {
 		const { shell, args } = getShellConfig();
-		const result = spawnSync(shell, [...args, command], {
+		const result = spawnSyncHidden(shell, [...args, command], {
 			encoding: "utf-8",
 			timeout: 10000,
 			stdio: ["ignore", "pipe", "ignore"],
 			shell: false,
-			windowsHide: true,
 		});
 
 		if (result.error) {
@@ -54,7 +60,7 @@ function executeWithConfiguredShell(command: string): { executed: boolean; value
 
 function executeWithDefaultShell(command: string): string | undefined {
 	try {
-		const output = execSync(command, {
+		const output = execSyncHidden(command, {
 			encoding: "utf-8",
 			timeout: 10000,
 			stdio: ["ignore", "pipe", "ignore"],
@@ -92,8 +98,7 @@ export function resolveConfigValueUncached(config: string): string | undefined {
 	if (config.startsWith("!")) {
 		return executeCommandUncached(config);
 	}
-	const envValue = process.env[config];
-	return envValue || config;
+	return resolveEnvOrLiteral(config);
 }
 
 export function resolveConfigValueOrThrow(config: string, description: string): string {
@@ -134,9 +139,4 @@ export function resolveHeadersOrThrow(
 		resolved[key] = resolveConfigValueOrThrow(value, `${description} header "${key}"`);
 	}
 	return Object.keys(resolved).length > 0 ? resolved : undefined;
-}
-
-/** Clear the config value command cache. Exported for testing. */
-export function clearConfigValueCache(): void {
-	commandResultCache.clear();
 }

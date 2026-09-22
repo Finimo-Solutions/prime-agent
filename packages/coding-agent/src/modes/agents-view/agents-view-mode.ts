@@ -29,6 +29,7 @@ import { ensureTool } from "../../utils/tools-manager.js";
 import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connection.js";
 import type { AgentConnectionHeartbeat, AgentConnectionSavedSessionInfo } from "../agent-connection/types.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../daemon/daemon-client.js";
+import { DaemonSessionRecoveringError, isDaemonUpdateRestartingError } from "../daemon/daemon-errors.js";
 import {
 	collectDaemonClientEnv,
 	type DaemonClosingReason,
@@ -36,6 +37,7 @@ import {
 	type DaemonResponse,
 	isUnknownDaemonCommandError,
 } from "../daemon/daemon-protocol.js";
+import { DaemonControlPlaneTransportError } from "../daemon/daemon-routed-client.js";
 import { resolveAttachModelFallbackMessage, type SessionSummary } from "../daemon/daemon-session-list.js";
 import { listDaemonHeartbeats } from "../daemon/heartbeat-catalog.js";
 import {
@@ -66,6 +68,7 @@ import {
 	type StartupNotices,
 } from "../shared/startup-notices.js";
 import {
+	type AgentsViewRecursiveRollup,
 	type AgentsViewRow,
 	type AgentsViewScopeFrame,
 	type AgentsViewScopeKey,
@@ -73,11 +76,14 @@ import {
 	type AgentsViewSelectionKey,
 	buildAgentsViewRows,
 	buildUnifiedSessionIndex,
+	computeRecursiveRollups,
 	createUnattachableChildOpenResult,
+	filterEmptyAgentsViewSessions,
 	filterUnifiedSessions,
 	formatHeartbeatBadge,
 	getAgentsViewSelectionKey,
 	getAgentsViewSessionTitle,
+	getSessionStatusLabel,
 	getAgentsViewSummaryIdentity as getSummaryIdentity,
 	getUnifiedSessionAncestorSessionIds,
 	hasUnifiedSessionChildren,
@@ -95,10 +101,11 @@ import {
 	type UnifiedSessionIndex,
 	type UnifiedSessionRecord,
 } from "./agents-view-state.js";
+import { AgentsViewRosterStore, STALE_ROSTER_DAEMON_MESSAGE } from "./roster-store.js";
 import { matchesSearchText } from "./session-view-search.js";
 
-const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_POLL_INTERVAL_MS = 15000;
+const SAVED_CATALOG_RECONCILE_INTERVAL_MS = 75;
 const RECONNECT_TIMEOUT_MS = 120000;
 const RECONNECT_RETRY_MS = 1000;
 const EXIT_HINT_DURATION_MS = 2000;
@@ -107,11 +114,8 @@ const STATUS_MESSAGE_DURATION_MS = 4500;
 const SEARCH_PROMPT_PLACEHOLDER = "Search sessions";
 const REPLY_PROMPT_FALLBACK_PLACEHOLDER = "Write a reply to this agent";
 const RESUME_PROMPT_PLACEHOLDER = "Write a prompt to resume this session";
-const COMPLETED_ROW_ICON = "✓";
-const NEEDS_INPUT_ROW_ICON = "●";
+const STATUS_ROW_ICON = "•";
 const SELECTED_ROW_MARKER = "\0agents-view-selected-row\0";
-// Tags a spawn-code line so finalize can wrap the whole row in a panel
-// background, visually segmenting the program from the agent rows.
 const CODE_ROW_MARKER = "\0agents-view-code-row\0";
 
 export interface AgentsViewModeOptions {
@@ -121,7 +125,6 @@ export interface AgentsViewModeOptions {
 	createUiServicesForSession?: (summary: SessionSummary) => Promise<InteractiveModeUiServices>;
 	migratedProviders?: string[];
 	modelFallbackMessage?: string;
-	startupModelId?: string;
 	verbose?: boolean;
 	recoverDaemon?: () => Promise<void>;
 	reconnectTimeoutMs?: number;
@@ -158,7 +161,6 @@ export type AgentsViewPersistentState = {
 	// Ancestor chain to re-expand on return to a nested agent. Kept by sessionId,
 	// not row identity, so it survives an active→persisted identity flip.
 	pendingExpandedAncestorSessionIds?: string[];
-	// Shared with each view instance so in-place expansion mutations survive remounts.
 	expandedSubagentParents?: Set<string>;
 	programShownParents?: Set<string>;
 	statusMessage?: string;
@@ -167,8 +169,11 @@ export type AgentsViewPersistentState = {
 	startupNotices?: StartupNotices;
 	startupNoticesPromise?: Promise<StartupNotices>;
 	query?: string;
+	rosterClient?: DaemonClient;
+	rosterStore?: AgentsViewRosterStore;
 	savedSessions?: AgentConnectionSavedSessionInfo[];
 	lastSuccessfulSavedSessions?: AgentConnectionSavedSessionInfo[];
+	savedCatalogLoaded?: boolean;
 	lastSuccessfulLiveSummaries?: SessionSummary[];
 	savedCatalogGeneration?: number;
 	heartbeats?: AgentConnectionHeartbeat[];
@@ -275,12 +280,16 @@ export function createInitialAgentsViewPersistentState(
 	options: Pick<AgentsViewModeOptions, "initialScopeKey" | "initialSession">,
 ): AgentsViewPersistentState {
 	const initialSession = options.initialSession;
+	// A scoped view excludes its root from its own rows, so anchoring the
+	// selection on the entered-from chat could never resolve there and would
+	// only arm the pending-anchor state for the whole catalog scan.
+	const seedSelection = initialSession && !options.initialScopeKey;
 	return {
-		...(initialSession
+		...(initialSession ? { backSession: initialSession } : {}),
+		...(seedSelection
 			? {
 					selectedRowIdentity: getSummaryIdentity(initialSession),
 					selectedSessionKey: getAgentsViewSelectionKey(initialSession),
-					backSession: initialSession,
 				}
 			: {}),
 		...(options.initialScopeKey
@@ -308,6 +317,157 @@ interface OpenedAgentsViewSession {
 	connection: DaemonAgentConnection;
 	summary: SessionSummary;
 	cwdFallbackNotice?: string;
+	updateRestartWaitNotice?: string;
+}
+
+/**
+ * Bounded wait budget for an open that arrives while the daemon is preparing
+ * an update restart. Mirrors the update coordinator's worst case (100s
+ * prepare + supervisor stop + 60s successor startup + session restore), the
+ * same budget attached sessions get to reconnect after an update.
+ */
+export const DAEMON_UPDATE_RESTART_OPEN_WAIT_MS = 240_000;
+const DAEMON_UPDATE_RESTART_OPEN_RETRY_MS = 500;
+
+export interface DaemonUpdateRestartWaitResult<T> {
+	result: T;
+	waitedForUpdateRestart: boolean;
+}
+
+/**
+ * Transport-level error codes that mean the socket was down while the daemon
+ * exited or its successor had not finished booting.
+ */
+const DAEMON_UPDATE_RESTART_TRANSIENT_ERROR_CODES = new Set([
+	"ECONNREFUSED",
+	"ECONNRESET",
+	"EPIPE",
+	"ENOENT",
+	"ETIMEDOUT",
+	"ECONNABORTED",
+]);
+
+/**
+ * True when an open failure is part of the normal update-restart window
+ * rather than a permanent failure: the preparing-restart rejection itself,
+ * transport failures while the daemon exits and its successor boots (socket
+ * close, connect/handshake/request timeouts, routed control-plane transport
+ * failures), and session-not-restored-yet misses ("Unknown active session", a
+ * session still recovering). Permanent create and attach failures (e.g. a
+ * missing session import file) return false so the open fails immediately
+ * instead of hiding behind the bounded update wait.
+ */
+function isDaemonUpdateRestartTransientError(error: unknown): boolean {
+	if (isDaemonUpdateRestartingError(error)) return true;
+	if (!(error instanceof Error)) return false;
+	if (isUnknownActiveSessionError(error)) return true;
+	if (error instanceof DaemonSessionRecoveringError) return true;
+	// A routed session transport wraps any control-plane transport failure
+	// (socket close, connect, timeouts — the restart-window shapes above);
+	// capability errors stay unwrapped and permanent.
+	if (error instanceof DaemonControlPlaneTransportError) return true;
+	const code = (error as NodeJS.ErrnoException).code;
+	if (typeof code === "string" && DAEMON_UPDATE_RESTART_TRANSIENT_ERROR_CODES.has(code)) return true;
+	return (
+		// Socket closed while the daemon exits for the restart.
+		error.message.startsWith("Connection to the Prime Agent daemon closed.") ||
+		// Connect failures while the successor socket is not listening yet.
+		error.message.startsWith("Failed to connect to the Prime Agent daemon:") ||
+		// A request attempted while the transport is down between daemon processes.
+		error.message.startsWith("Cannot send daemon command") ||
+		// Transport timeouts while the daemon exits and its successor boots:
+		// connect, handshake, and in-flight requests (e.g. create) that cannot
+		// get a response until the successor is ready.
+		/^Timed out after \d+ms (connecting to the Prime Agent daemon|waiting for the Prime Agent daemon handshake|waiting for the Prime Agent daemon response to)/.test(
+			error.message,
+		)
+	);
+}
+
+function daemonUpdateRestartDeadlineError(waitMs: number, lastError: unknown): Error {
+	const lastErrorText =
+		lastError === undefined ? "none yet" : lastError instanceof Error ? lastError.message : String(lastError);
+	return new Error(
+		`The Prime Agent daemon did not finish its update restart within ${Math.round(waitMs / 1000)} seconds. Try opening this agent again once the update finishes. Last error: ${lastErrorText}`,
+	);
+}
+
+/**
+ * Run an open attempt, retrying while the daemon is in the update-restart
+ * transient state instead of failing the open. The first
+ * "preparing an update restart" rejection arms the wait; once armed, only
+ * restart-transient failures of the restart itself (socket close while the
+ * daemon exits, connect errors while the successor boots, session-not-yet-
+ * restored misses) stay inside the same bounded loop, because they are all part
+ * of the same normal update restart, while permanent failures (e.g. a missing
+ * session file) propagate immediately instead of hiding behind the wait. A
+ * non-update error before any update-restart signal propagates unchanged. The
+ * wait budget bounds the whole wait: each attempt is raced against the
+ * remaining budget, so an in-flight attempt (e.g. a create request with its own
+ * 30-second timeout) cannot hold the open past the deadline, which fails with a
+ * clear actionable message that includes the last error. A losing attempt that
+ * still settles afterwards is not abandoned silently: its result goes to
+ * onAbandoned for disposal and its failure is swallowed.
+ */
+export async function waitThroughDaemonUpdateRestart<T>(
+	attempt: () => Promise<T>,
+	options: {
+		waitMs?: number;
+		retryMs?: number;
+		onWait?: (error: unknown) => void;
+		/** Called with the result of an attempt that resolves after the deadline already failed the open, so resources nobody receives can be disposed. */
+		onAbandoned?: (result: T) => void;
+	} = {},
+): Promise<DaemonUpdateRestartWaitResult<T>> {
+	const waitMs = options.waitMs ?? DAEMON_UPDATE_RESTART_OPEN_WAIT_MS;
+	const retryMs = options.retryMs ?? DAEMON_UPDATE_RESTART_OPEN_RETRY_MS;
+	const deadline = Date.now() + waitMs;
+	let sawUpdateRestart = false;
+	let lastError: unknown;
+	let attemptAbandoned = false;
+	while (true) {
+		const deadlineError = daemonUpdateRestartDeadlineError(waitMs, lastError);
+		// An in-flight attempt (e.g. a create request with its own 30-second
+		// timeout) must not push the open past the deadline: race every attempt
+		// against the remaining budget so the bound holds.
+		let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+		const deadlineHit = new Promise<never>((_, reject) => {
+			deadlineTimer = setTimeout(() => reject(deadlineError), Math.max(0, deadline - Date.now()));
+		});
+		const attemptPromise = attempt();
+		// The race cannot cancel the losing attempt: when the deadline wins, a
+		// late success must still be disposed (nobody receives its result), and
+		// a late failure is expected and must not surface as unhandled.
+		void attemptPromise.then(
+			(result) => {
+				if (attemptAbandoned) options.onAbandoned?.(result);
+			},
+			() => undefined,
+		);
+		try {
+			const result = await Promise.race([attemptPromise, deadlineHit]);
+			clearTimeout(deadlineTimer);
+			return { result, waitedForUpdateRestart: sawUpdateRestart };
+		} catch (error) {
+			clearTimeout(deadlineTimer);
+			if (error === deadlineError) {
+				attemptAbandoned = true;
+				throw deadlineError;
+			}
+			if (!sawUpdateRestart) {
+				if (!isDaemonUpdateRestartingError(error)) throw error;
+				sawUpdateRestart = true;
+				options.onWait?.(error);
+			} else if (!isDaemonUpdateRestartTransientError(error)) {
+				throw error;
+			}
+			lastError = error;
+			if (Date.now() + retryMs > deadline) {
+				throw daemonUpdateRestartDeadlineError(waitMs, lastError);
+			}
+			await new Promise((resolve) => setTimeout(resolve, retryMs));
+		}
+	}
 }
 
 export function resolveAgentsViewOpenCwd(
@@ -334,6 +494,7 @@ async function openAgentsViewSession(
 		try {
 			const connection = await DaemonAgentConnection.attach(client, summary.activeSessionId, {
 				closeClientOnDispose: true,
+				deferSessionEvents: true,
 				recoverDaemon: options.recoverDaemon,
 				reconnectTimeoutMs: options.reconnectTimeoutMs,
 				telemetryDisabled: options.config.telemetryDisabled,
@@ -341,7 +502,11 @@ async function openAgentsViewSession(
 			return { connection, summary };
 		} catch (error) {
 			client.close();
-			if (!summary.sessionFile || !isUnknownActiveSessionError(error)) {
+			// Recovering takes the saved-session path too; its create/open route retries the recovery.
+			if (
+				!summary.sessionFile ||
+				!(isUnknownActiveSessionError(error) || error instanceof DaemonSessionRecoveringError)
+			) {
 				throw error;
 			}
 			client = await connectAgentsViewDaemonClient(socketPath);
@@ -357,6 +522,7 @@ async function openAgentsViewSession(
 		const resumed = await resumeSavedAgentsViewSession(client, options.config, summary);
 		const connection = await DaemonAgentConnection.attach(client, resumed.activeSessionId, {
 			closeClientOnDispose: true,
+			deferSessionEvents: true,
 			recoverDaemon: options.recoverDaemon,
 			reconnectTimeoutMs: options.reconnectTimeoutMs,
 			telemetryDisabled: options.config.telemetryDisabled,
@@ -421,6 +587,22 @@ export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise
 	const persistentState = createInitialAgentsViewPersistentState(options);
 	const promptStashStore = options.promptStashStore ?? new ClientPromptStashStore();
 
+	try {
+		await runAgentsViewLoop(options, persistentState, promptStashStore);
+	} finally {
+		// Close first: the supervisor drops the subscription with the socket.
+		persistentState.rosterClient?.close();
+		await persistentState.rosterStore?.dispose();
+		persistentState.rosterStore = undefined;
+		persistentState.rosterClient = undefined;
+	}
+}
+
+async function runAgentsViewLoop(
+	options: AgentsViewModeOptions,
+	persistentState: AgentsViewPersistentState,
+	promptStashStore: ClientPromptStashStore,
+): Promise<void> {
 	while (true) {
 		const view = new AgentsViewMode(options, persistentState);
 		const viewResult = await view.run();
@@ -448,13 +630,36 @@ export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise
 
 		let opened: OpenedAgentsViewSession | undefined;
 		try {
-			opened = await openAgentsViewSession(options, result.summary);
+			// An auto-update can fence session opens as "preparing an update
+			// restart" at the exact moment the user hits enter; the restart is a
+			// normal transient state, so wait through it instead of failing.
+			const openedThroughUpdate = await waitThroughDaemonUpdateRestart(
+				() => openAgentsViewSession(options, result.summary),
+				{
+					onWait: (error) => logClientError("Waiting for daemon update restart to finish before opening", error),
+					// An open that resolves after the deadline already failed the
+					// wait: dispose the connection nobody received instead of
+					// leaking it.
+					onAbandoned: (abandoned) => {
+						void abandoned.connection.dispose().catch(() => undefined);
+					},
+				},
+			);
+			opened = openedThroughUpdate.result;
 			persistentState.backSession = opened.summary;
-			if (opened.cwdFallbackNotice) {
-				persistentState.statusMessage = combineAgentsViewStartupNotices(
-					result.statusMessage,
-					opened.cwdFallbackNotice,
-				);
+			if (openedThroughUpdate.waitedForUpdateRestart) {
+				opened = {
+					...opened,
+					updateRestartWaitNotice:
+						"Waited for the Prime Agent daemon update restart to finish before opening this agent",
+				};
+			}
+			const openStartupNotice = combineAgentsViewStartupNotices(
+				opened.cwdFallbackNotice,
+				opened.updateRestartWaitNotice,
+			);
+			if (openStartupNotice) {
+				persistentState.statusMessage = combineAgentsViewStartupNotices(result.statusMessage, openStartupNotice);
 			}
 			const uiServices = await resolveAgentsViewSessionUiServices(options, opened.summary);
 			const interactiveMode = new InteractiveMode({
@@ -466,7 +671,7 @@ export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise
 				bindLocalSessionExtensions: false,
 				migratedProviders: options.migratedProviders,
 				modelFallbackMessage: resolveAttachModelFallbackMessage(opened.summary, options.modelFallbackMessage),
-				startupNotice: combineAgentsViewStartupNotices(result.statusMessage, opened.cwdFallbackNotice),
+				startupNotice: combineAgentsViewStartupNotices(result.statusMessage, openStartupNotice),
 				verbose: options.verbose,
 				returnToAgentsView: true,
 				forceFullscreen: true,
@@ -631,7 +836,6 @@ export class AgentsViewMode implements Component, Focusable {
 	private reconnectTimedOut = false;
 	private daemonShutdownReceived = false;
 	private resolveRun: ((result: AgentsViewRunResult) => void) | undefined;
-	private pollTimer: NodeJS.Timeout | undefined;
 	private heartbeatPollTimer: NodeJS.Timeout | undefined;
 	private animationTimer: NodeJS.Timeout | undefined;
 	private ctrlCExitHintExpiresAt = 0;
@@ -647,17 +851,15 @@ export class AgentsViewMode implements Component, Focusable {
 	private heartbeats: AgentConnectionHeartbeat[] = [];
 	private unifiedRecords: UnifiedSessionRecord[] = [];
 	private unifiedIndex: UnifiedSessionIndex = buildUnifiedSessionIndex([]);
+	private recursiveRollups: ReadonlyMap<UnifiedSessionRecord, AgentsViewRecursiveRollup> = new Map();
 	private scopedRecords: UnifiedSessionRecord[] = [];
 	private scopeKey: AgentsViewScopeKey | undefined;
 	private scopeRootSummary: SessionSummary | undefined;
-	private liveCatalogReady = false;
 	private savedCatalogReady = false;
 	private savedCatalogGeneration = 0;
-	private liveCatalogGeneration = 0;
 	private heartbeatCatalogGeneration = 0;
-	private liveCatalogPollPromise: Promise<void> | undefined;
-	private liveCatalogRefreshPending = false;
 	private savedCatalogRefreshPending = false;
+	private savedCatalogReconcileTimer: ReturnType<typeof setTimeout> | undefined;
 	private expandedSubagentParents = new Set<string>();
 	// Agent row identities whose full spawn program is currently shown.
 	// The program key toggles each agent shown ↔ hidden.
@@ -680,7 +882,12 @@ export class AgentsViewMode implements Component, Focusable {
 	private pendingKillSubagent: PendingKillSubagent | undefined;
 	private renameTarget: { activeSessionId?: string; sessionFile?: string; summary: SessionSummary } | undefined;
 	private actionModeSearchQuery: string | undefined;
+	/** Session the view was entered from; exempt from the empty-session sort demotion. */
+	private readonly anchorSessionId: string | undefined;
 	private readonly inactiveAgentIdentities = new Set<string>();
+	private rosterStore: AgentsViewRosterStore | undefined;
+	private unsubscribeRosterUpdate: (() => void) | undefined;
+	private savedSearchFetchStarted = false;
 	private statusMessage: string | undefined;
 	private statusMessageTone: "muted" | "error" | "warning" = "muted";
 	private statusMessageSticky = false;
@@ -698,6 +905,7 @@ export class AgentsViewMode implements Component, Focusable {
 				persistentState.backSession ?? options.initialSession,
 			);
 		persistentState.scopeFrames = initialFrames;
+		this.anchorSessionId = (persistentState.backSession ?? options.initialSession)?.sessionId;
 		this.scopeKey = initialFrames.at(-1)?.scope;
 		this.scopeRootSummary = persistentState.scopeRootSummary;
 		this.selectedRowIdentity = persistentState.selectedRowIdentity;
@@ -706,7 +914,7 @@ export class AgentsViewMode implements Component, Focusable {
 		this.lastListedSummaries = persistentState.lastSuccessfulLiveSummaries ?? [];
 		this.savedSessions = persistentState.savedSessions ?? [];
 		this.lastSuccessfulSavedSessions = persistentState.lastSuccessfulSavedSessions ?? this.savedSessions;
-		this.savedCatalogReady = persistentState.lastSuccessfulSavedSessions !== undefined;
+		this.savedCatalogReady = persistentState.savedCatalogLoaded === true;
 		this.heartbeats = persistentState.heartbeats ?? [];
 		this.savedCatalogGeneration = persistentState.savedCatalogGeneration ?? 0;
 		this.expandedSubagentParents = persistentState.expandedSubagentParents ?? new Set();
@@ -812,32 +1020,32 @@ export class AgentsViewMode implements Component, Focusable {
 				this.editor.invalidate();
 			},
 		};
-		this.splash = new BrandSplashHeader(
-			VERSION,
-			() => this.getSplashModelId(),
-			() => this.getSplashCwd(),
-			undefined,
-			{
-				topPadding: true,
-				getExtraMetadata: () => {
-					const root = this.scopeRootSummary;
-					return [
-						{ label: "agents", value: this.getAgentCountsText() },
-						{ label: "scope", value: root ? getAgentsViewSessionTitle(root) : "global" },
-						{ label: "depth", value: String(getAgentsViewDepth(root)) },
-					];
-				},
+		this.splash = new BrandSplashHeader(VERSION, () => this.getSplashCwd(), undefined, {
+			topPadding: true,
+			getExtraMetadata: () => {
+				const root = this.scopeRootSummary;
+				return [
+					{ label: "agents", value: this.getAgentCountsText() },
+					...(root ? [{ label: "depth", value: String(getAgentsViewDepth(root)) }] : []),
+				];
 			},
-		);
+		});
 	}
 
 	async run(): Promise<AgentsViewRunResult> {
-		this.client = new DaemonClient(this.requireSocketPath());
-		await this.client.connect();
-		this.subscribeToClientClose(this.client);
-		this.unsubscribeClientMessage = this.client.onMessage((message) => {
+		this.persistentState.rosterClient ??= new DaemonClient(this.requireSocketPath());
+		const client = this.persistentState.rosterClient;
+		this.client = client;
+		if (!client.isConnected) await client.reconnect();
+		this.unsubscribeClientMessage = client.onMessage((message) => {
 			if (message.type === "heartbeats_changed") void this.refreshHeartbeats();
 		});
+		this.persistentState.rosterStore ??= new AgentsViewRosterStore();
+		this.rosterStore = this.persistentState.rosterStore;
+		if (!(await this.rosterStore.attach(client))) {
+			throw new Error(STALE_ROSTER_DAEMON_MESSAGE);
+		}
+		this.subscribeToClientClose(client);
 
 		this.ui.addChild(this);
 		this.ui.setFocus(this);
@@ -862,17 +1070,19 @@ export class AgentsViewMode implements Component, Focusable {
 		const runPromise = new Promise<AgentsViewRunResult>((resolve) => {
 			this.resolveRun = resolve;
 		});
-		void this.refreshSessions();
-		void this.refreshSavedSessions();
+		this.unsubscribeRosterUpdate = this.rosterStore.onUpdate(() => this.onRosterUpdate());
+		this.applySessionList(this.rosterStore.summaries(), true);
+		this.armSavedSearchFetch();
+		this.resolveMissingSelectionAnchor();
 		void this.refreshHeartbeats();
 		this.loadStartupNotices();
-		this.pollTimer = setInterval(() => this.pollSessions(), POLL_INTERVAL_MS);
-		this.pollTimer.unref?.();
 		this.heartbeatPollTimer = setInterval(() => void this.refreshHeartbeats(), HEARTBEAT_POLL_INTERVAL_MS);
 		this.heartbeatPollTimer.unref?.();
 		this.animationTimer = setInterval(() => {
-			if (!this.rows.some((row) => row.section === "running")) return;
-			this.workingIconFrame += 1;
+			const hasRunning = this.rows.some((row) => row.section === "running");
+			const hasStaleAge = this.rows.some((row) => row.summary.lastHeardFromAt !== undefined);
+			if (!hasRunning && !hasStaleAge) return;
+			if (hasRunning) this.workingIconFrame += 1;
 			this.ui.requestRender();
 		}, WORKING_ICON_INTERVAL_MS);
 		this.animationTimer.unref?.();
@@ -926,6 +1136,13 @@ export class AgentsViewMode implements Component, Focusable {
 			this.cycleProgramForSelected();
 			return;
 		}
+		if (!this.replyTarget && this.editor.getText().length === 0) {
+			if (this.keybindings.matches(data, "app.agents.expand")) {
+				const row = this.rows[this.selectedIndex];
+				if (row && (row.kind === "subagent-summary" || row.descendantCount > 0)) this.toggleSubagentList(row);
+				return;
+			}
+		}
 		if (!this.replyTarget && this.keybindings.matches(data, "app.agents.open")) {
 			if (this.editor.getText().length === 0 || this.isSearchCursorAtEnd()) {
 				this.openSelected();
@@ -972,6 +1189,11 @@ export class AgentsViewMode implements Component, Focusable {
 		if (noticeLines.length > 0) {
 			headerLines.push("", ...noticeLines);
 		}
+		const root = this.scopeRootSummary;
+		if (root) {
+			const scopeLabel = `${keyText("app.agents.back")} back · ${getAgentsViewSessionTitle(root)} › subagents`;
+			headerLines.push("", truncateToWidth(theme.fg("dim", scopeLabel), width));
+		}
 		headerLines.push("");
 
 		// The prompt belongs to the scroll pane rather than the fullscreen dock, but
@@ -1009,8 +1231,6 @@ export class AgentsViewMode implements Component, Focusable {
 		void promise
 			.then((notices) => {
 				this.persistentState.startupNotices = notices;
-				// Best-effort immediate paint; a re-entered instance also picks this up on
-				// its next poll tick since render reads persistentState directly.
 				this.ui.requestRender();
 			})
 			.catch(() => {});
@@ -1213,6 +1433,8 @@ export class AgentsViewMode implements Component, Focusable {
 		while (added) {
 			added = false;
 			for (const row of this.rows) {
+				// Summary/code rows reuse their parent's summary; only session rows own expansion keys.
+				if (row.kind !== "agent" && row.kind !== "subagent") continue;
 				if (wanted.has(row.summary.sessionId) && !this.expandedSubagentParents.has(row.identity)) {
 					this.expandedSubagentParents.add(row.identity);
 					added = true;
@@ -1229,18 +1451,36 @@ export class AgentsViewMode implements Component, Focusable {
 		this.queryChanged();
 	}
 
+	private armSavedSearchFetch(options: { duringReconnect?: boolean } = {}): void {
+		// The inactive section is catalog-fed, so no query gate: load on view open.
+		if (this.savedSearchFetchStarted || this.persistentState.savedCatalogLoaded === true) {
+			return;
+		}
+		this.savedSearchFetchStarted = true;
+		void this.refreshSavedSessions({ ...options, preserveStatusOnError: true });
+	}
+
 	private queryChanged(): void {
 		this.persistentState.query = this.editor.getText();
+		this.armSavedSearchFetch();
 		this.rebuildRows();
-		// Typing must not claim the visible fallback row while the restored
-		// anchor is still waiting for its catalog row.
-		if (!this.selectionAnchorPending) this.syncSelectedRowState();
+		// Searching is explicit user intent: claim the visible row as the new
+		// anchor even if a remembered one is still waiting for its catalog row.
+		this.syncSelectedRowState();
 		this.ui.requestRender();
 	}
 
 	private getFilteredRecords(): UnifiedSessionRecord[] {
 		const query = this.replyTarget || this.renameTarget ? (this.actionModeSearchQuery ?? "") : this.editor.getText();
-		return filterUnifiedSessions(this.scopedRecords, (text) => matchesSearchText(text, query));
+		const preservedSessionIds = new Set([
+			...(this.anchorSessionId ? [this.anchorSessionId] : []),
+			...(this.scopeKey ? [this.scopeKey.sessionId] : []),
+			...this.heartbeats.map((heartbeat) => heartbeat.job.sessionId),
+		]);
+		const records = filterEmptyAgentsViewSessions(this.scopedRecords, preservedSessionIds, this.unifiedIndex);
+		return query.trim()
+			? filterUnifiedSessions(records, (text) => matchesSearchText(text, query), this.unifiedIndex)
+			: records;
 	}
 
 	/** Rebuild rows from the last fetched summaries, keeping selection on the same row. */
@@ -1251,6 +1491,8 @@ export class AgentsViewMode implements Component, Focusable {
 			this.expandedSubagentParents,
 			this.programShownParents,
 			this.scopeKey,
+			this.recursiveRollups,
+			this.anchorSessionId,
 		);
 		const index =
 			selectedIdentity === undefined ? -1 : this.rows.findIndex((row) => row.identity === selectedIdentity);
@@ -1298,7 +1540,7 @@ export class AgentsViewMode implements Component, Focusable {
 						this.setReplyTarget(undefined);
 					}
 					// Keep the send outcome (or sticky cwd notice) that sendReply just surfaced.
-					await this.refreshSessions({ preserveStatusOnError: true });
+					await this.refreshSessions();
 				} else if (this.replyTarget === target && this.editor.getText().length === 0) {
 					this.editor.setText(value);
 				}
@@ -1331,10 +1573,6 @@ export class AgentsViewMode implements Component, Focusable {
 		if (!row?.selectable || this.isPendingDeleteRow(row)) {
 			return;
 		}
-		if (this.selectionAnchorPending) {
-			this.setStatusMessage("Waiting for the selected session to load");
-			return;
-		}
 		if (row.kind === "subagent-summary") {
 			this.toggleSubagentList(row);
 			return;
@@ -1359,16 +1597,12 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private toggleSubagentList(row: AgentsViewRow): void {
-		if (!row.parentIdentity) {
-			return;
-		}
-		if (this.expandedSubagentParents.has(row.parentIdentity)) {
-			this.expandedSubagentParents.delete(row.parentIdentity);
-			// A collapsed agent's revealed program collapses with it, so reopening
-			// starts from the hidden state rather than a stale reveal.
-			this.programShownParents.delete(row.parentIdentity);
+		const target = row.kind === "subagent-summary" ? (row.parentIdentity ?? row.identity) : row.identity;
+		if (this.expandedSubagentParents.has(target)) {
+			this.expandedSubagentParents.delete(target);
+			this.programShownParents.delete(target);
 		} else {
-			this.expandedSubagentParents.add(row.parentIdentity);
+			this.expandedSubagentParents.add(target);
 		}
 		this.rebuildRows();
 		this.syncSelectedRowState();
@@ -1419,16 +1653,6 @@ export class AgentsViewMode implements Component, Focusable {
 			}
 		}
 		return false;
-	}
-
-	/** True when the selected row exposes the "show program" affordance. */
-	private selectedRowCanShowProgram(): boolean {
-		const row = this.rows[this.selectedIndex];
-		if (!row) {
-			return false;
-		}
-		const target = row.kind === "agent" ? row.identity : row.parentIdentity;
-		return target !== undefined && this.targetHasSpawnCode(target);
 	}
 
 	private openSelectedSubagent(row: AgentsViewRow): void {
@@ -1626,8 +1850,9 @@ export class AgentsViewMode implements Component, Focusable {
 				this.setStatusMessage("This session cannot be renamed", { tone: "warning" });
 				return false;
 			}
-			const refreshed = await this.refreshBothCatalogs();
-			this.setStatusMessage(refreshed ? `Renamed to ${name}` : `Renamed to ${name}; refresh failed`);
+			await this.refreshSessions();
+			this.refreshSavedSessionsIfLoaded();
+			this.setStatusMessage(`Renamed to ${name}`);
 			return true;
 		} catch (error) {
 			this.setStatusMessage(
@@ -1716,7 +1941,7 @@ export class AgentsViewMode implements Component, Focusable {
 			return true;
 		} catch (error) {
 			this.setStatusMessage(formatError("Failed to send reply", error));
-			if (didResume) await this.refreshSessions({ preserveStatusOnError: true });
+			if (didResume) await this.refreshSessions();
 			return false;
 		}
 	}
@@ -1776,7 +2001,9 @@ export class AgentsViewMode implements Component, Focusable {
 						this.setStatusMessage("Usage: /name <session name>", { tone: "warning" });
 						return false;
 					}
-					return await this.renameSession(target, name);
+					const renamed = await this.renameSession(target, name);
+					if (renamed) disarmIfUnchanged();
+					return renamed;
 				}
 				case "kill": {
 					if (!target.activeSessionId) {
@@ -1793,7 +2020,7 @@ export class AgentsViewMode implements Component, Focusable {
 					}
 					disarmIfUnchanged();
 					this.setStatusMessage("Agent stopped");
-					await this.refreshBothCatalogs();
+					await this.refreshSessions();
 					return true;
 				}
 			}
@@ -1840,10 +2067,10 @@ export class AgentsViewMode implements Component, Focusable {
 			if (this.pendingDeleteAgent?.identity === identity && this.isDeleteConfirmationVisible()) {
 				this.clearDeleteConfirmation({ render: false });
 				try {
+					// Authoritative liveness check; its narrower plain-list verdict stays local.
 					const latest = expectSessionList(
 						requireDaemonData(await this.requireClient().request(createAgentsViewListCommand())),
 					);
-					this.lastListedSummaries = latest;
 					const active = resolveAgentsViewActiveSummaryForPath(row.summary.sessionFile, latest);
 					if (active) {
 						this.pendingDeleteAgent = undefined;
@@ -1863,7 +2090,9 @@ export class AgentsViewMode implements Component, Focusable {
 						return;
 					}
 					this.pendingDeleteAgent = undefined;
-					const refreshed = await this.refreshSavedSessions({ preserveStatusOnError: true });
+					const refreshed =
+						!this.persistentState.savedCatalogLoaded ||
+						(await this.refreshSavedSessions({ preserveStatusOnError: true }));
 					const success = result.method === "trash" ? "Session moved to trash" : "Session deleted";
 					this.setStatusMessage(refreshed ? success : `${success}; refresh failed`);
 				} catch (error) {
@@ -1910,7 +2139,7 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private async killSubagent(pending: PendingKillSubagent, currentRow: AgentsViewRow): Promise<void> {
-		const running = currentRow.section === "running";
+		const running = hasLiveWork(currentRow);
 		const client = this.requireClient();
 		this.setStatusMessage(running ? "Stopping subagent..." : "Deleting subagent...");
 		try {
@@ -1976,7 +2205,7 @@ export class AgentsViewMode implements Component, Focusable {
 			this.showDeleteConfirmation();
 			return;
 		}
-		if (!isRunningSessionSummary(row.summary)) {
+		if (!hasLiveWork(row)) {
 			this.pendingDeleteAgent = {
 				identity,
 				activeSessionId,
@@ -2049,6 +2278,7 @@ export class AgentsViewMode implements Component, Focusable {
 			this.selectedActiveSessionId = undefined;
 			this.setStatusMessage("Agent inactive", { render: false });
 			await this.refreshSessions();
+			this.refreshSavedSessionsIfLoaded();
 		} catch (error) {
 			this.setStatusMessage(formatError("Failed to deactivate agent", error));
 		}
@@ -2081,55 +2311,20 @@ export class AgentsViewMode implements Component, Focusable {
 		requireDaemonData(response);
 	}
 
-	private pollSessions(): void {
-		if (this.liveCatalogPollPromise) return;
-		const poll = this.refreshSessions().then(() => undefined);
-		this.liveCatalogPollPromise = poll;
-		void poll.finally(() => {
-			if (this.liveCatalogPollPromise === poll) this.liveCatalogPollPromise = undefined;
-		});
+	private onRosterUpdate(): void {
+		if (this.stopped || !this.rosterStore) return;
+		this.applySessionList(this.rosterStore.summaries(), true);
+		this.resolveMissingSelectionAnchor();
 	}
 
-	private async refreshSessions(options: { preserveStatusOnError?: boolean } = {}): Promise<boolean> {
-		if (this.reconnectPromise || this.daemonShutdownReceived) return false;
-		const generation = ++this.liveCatalogGeneration;
-		this.liveCatalogRefreshPending = true;
-		try {
-			const client = this.requireClient();
-			try {
-				const response = await client.request(createAgentsViewListCommand());
-				if (generation !== this.liveCatalogGeneration) return false;
-				this.liveCatalogReady = true;
-				this.applySessionList(expectSessionList(requireDaemonData(response)), true);
-				return true;
-			} catch (error) {
-				if (generation === this.liveCatalogGeneration) {
-					// A completed failed attempt is still catalog-settled: otherwise a
-					// vanished scope can permanently trap an empty view.
-					this.liveCatalogReady = true;
-					this.reconcileCatalogs();
-					if (!options.preserveStatusOnError && !this.reconnectPromise) {
-						if (client.isConnected) this.setStatusMessage(formatError("Failed to refresh agents", error));
-						else this.startClientReconnect(client, error);
-					}
-				}
-				return false;
-			}
-		} catch (error) {
-			if (generation === this.liveCatalogGeneration) {
-				this.liveCatalogReady = true;
-				this.reconcileCatalogs();
-				if (!options.preserveStatusOnError) {
-					this.setStatusMessage(formatError("Failed to refresh current session", error));
-				}
-			}
-			return false;
-		} finally {
-			if (generation === this.liveCatalogGeneration) {
-				this.liveCatalogRefreshPending = false;
-				this.resolveMissingSelectionAnchor();
-			}
-		}
+	private refreshSavedSessionsIfLoaded(): void {
+		if (this.persistentState.savedCatalogLoaded) void this.refreshSavedSessions({ preserveStatusOnError: true });
+	}
+
+	private async refreshSessions(): Promise<void> {
+		if (this.reconnectPromise || this.daemonShutdownReceived || !this.rosterStore) return;
+		this.applySessionList(this.rosterStore.summaries(), true);
+		this.resolveMissingSelectionAnchor();
 	}
 
 	private applySessionList(sessions: SessionSummary[], successful = false): void {
@@ -2145,12 +2340,13 @@ export class AgentsViewMode implements Component, Focusable {
 		this.lastVisibleSummaries = this.withPendingDeleteSession(visibleSessions);
 		this.unifiedRecords = reconcileUnifiedSessions(this.lastVisibleSummaries, this.savedSessions, this.heartbeats);
 		this.unifiedIndex = buildUnifiedSessionIndex(this.unifiedRecords);
+		this.recursiveRollups = computeRecursiveRollups(this.unifiedRecords, this.unifiedIndex);
 		migrateAgentsViewIdentitySet(this.expandedSubagentParents, this.unifiedIndex.byKey);
 		migrateAgentsViewIdentitySet(this.programShownParents, this.unifiedIndex.byKey);
 
 		const frames = this.persistentState.scopeFrames ?? [];
 		const resolution = resolveAgentsViewScopeFrames(this.unifiedRecords, frames, this.unifiedIndex);
-		if (shouldApplyScopeResolution(resolution.droppedFrames, this.liveCatalogReady, this.savedCatalogReady)) {
+		if (shouldApplyScopeResolution(resolution.droppedFrames, this.savedCatalogReady)) {
 			this.persistentState.scopeFrames = resolution.frames;
 			this.scopeKey = resolution.frames.at(-1)?.scope;
 			this.scopeRootSummary = resolution.root ? summaryForUnifiedRecord(resolution.root) : undefined;
@@ -2166,27 +2362,31 @@ export class AgentsViewMode implements Component, Focusable {
 			this.expandedSubagentParents,
 			this.programShownParents,
 			this.scopeKey,
+			this.recursiveRollups,
+			this.anchorSessionId,
 		);
 		this.applyPendingAncestorExpansion();
 		this.restoreSelection();
 		this.ui.requestRender();
 	}
 
-	/** A session appears in both catalogs; mutations must refresh both. */
-	private async refreshBothCatalogs(): Promise<boolean> {
-		const results = await Promise.all([
-			this.refreshSessions({ preserveStatusOnError: true }),
-			this.refreshSavedSessions({ preserveStatusOnError: true }),
-		]);
-		return results.every(Boolean);
+	private rearmSavedSearchFetch(): void {
+		if (this.persistentState.savedCatalogLoaded !== true) this.savedSearchFetchStarted = false;
 	}
 
 	private async refreshSavedSessions(
 		options: { duringReconnect?: boolean; preserveStatusOnError?: boolean } = {},
 	): Promise<boolean> {
-		if ((!options.duringReconnect && this.reconnectPromise) || this.daemonShutdownReceived) return false;
+		if ((!options.duringReconnect && this.reconnectPromise) || this.daemonShutdownReceived) {
+			this.rearmSavedSearchFetch();
+			return false;
+		}
 		const generation = ++this.savedCatalogGeneration;
 		this.persistentState.savedCatalogGeneration = generation;
+		if (this.savedCatalogReconcileTimer) {
+			clearTimeout(this.savedCatalogReconcileTimer);
+			this.savedCatalogReconcileTimer = undefined;
+		}
 		this.savedCatalogRefreshPending = true;
 		this.savedCatalogReady = false;
 		const successfulSessions = this.lastSuccessfulSavedSessions;
@@ -2197,9 +2397,16 @@ export class AgentsViewMode implements Component, Focusable {
 			const onSession = (session: AgentConnectionSavedSessionInfo) => {
 				if (generation !== this.savedCatalogGeneration) return;
 				progressiveSessions.set(resolvePath(canonicalizePath(session.path)), session);
-				this.savedSessions = [...progressiveSessions.values()];
-				this.persistentState.savedSessions = this.savedSessions;
-				this.reconcileCatalogs();
+				// Keep a bounded batch window so a continuous stream still appears progressively.
+				if (this.savedCatalogReconcileTimer) return;
+				this.savedCatalogReconcileTimer = setTimeout(() => {
+					if (generation !== this.savedCatalogGeneration) return;
+					this.savedCatalogReconcileTimer = undefined;
+					this.savedSessions = [...progressiveSessions.values()];
+					this.persistentState.savedSessions = this.savedSessions;
+					this.reconcileCatalogs();
+				}, SAVED_CATALOG_RECONCILE_INTERVAL_MS);
+				this.savedCatalogReconcileTimer.unref?.();
 			};
 			const sessions = await listDaemonSavedSessions(
 				this.requireClient(),
@@ -2215,6 +2422,7 @@ export class AgentsViewMode implements Component, Focusable {
 			this.savedCatalogReady = true;
 			this.persistentState.lastSuccessfulSavedSessions = sessions;
 			this.persistentState.savedSessions = sessions;
+			this.persistentState.savedCatalogLoaded = true;
 			this.reconcileCatalogs();
 			return true;
 		} catch (error) {
@@ -2223,6 +2431,7 @@ export class AgentsViewMode implements Component, Focusable {
 				this.persistentState.savedSessions = successfulSessions;
 				// Treat a terminal failure as settled so scope fallback cannot soft-lock.
 				this.savedCatalogReady = true;
+				this.rearmSavedSearchFetch();
 				this.reconcileCatalogs();
 				if (!options.preserveStatusOnError && !this.reconnectPromise && !this.daemonShutdownReceived) {
 					this.setStatusMessage(formatError("Failed to load saved sessions", error));
@@ -2231,6 +2440,10 @@ export class AgentsViewMode implements Component, Focusable {
 			return false;
 		} finally {
 			if (generation === this.savedCatalogGeneration) {
+				if (this.savedCatalogReconcileTimer) {
+					clearTimeout(this.savedCatalogReconcileTimer);
+					this.savedCatalogReconcileTimer = undefined;
+				}
 				this.savedCatalogRefreshPending = false;
 				this.resolveMissingSelectionAnchor();
 			}
@@ -2249,7 +2462,12 @@ export class AgentsViewMode implements Component, Focusable {
 			return true;
 		} catch (error) {
 			if (generation === this.heartbeatCatalogGeneration && !this.reconnectPromise) {
-				this.setStatusMessage(formatError("Failed to refresh heartbeats", error));
+				const client = this.client;
+				if (client && !client.isConnected) {
+					this.startClientReconnect(client, error);
+				} else if (!this.statusMessageSticky) {
+					this.setStatusMessage(formatError("Failed to refresh heartbeats", error));
+				}
 			}
 			return false;
 		}
@@ -2278,11 +2496,9 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private resolveMissingSelectionAnchor(): void {
-		if (!this.selectionAnchorPending || this.liveCatalogRefreshPending || this.savedCatalogRefreshPending) {
+		if (!this.selectionAnchorPending || this.savedCatalogRefreshPending) {
 			return;
 		}
-		// Unblock the fallback row, but keep the anchor identities: a later poll
-		// can still deliver the intended session and re-anchor selection to it.
 		this.selectionAnchorPending = false;
 		const row = this.rows[this.selectedIndex];
 		this.selectedActiveSessionId = row?.selectable ? (row.summary.activeSessionId ?? row.summary.id) : undefined;
@@ -2294,10 +2510,11 @@ export class AgentsViewMode implements Component, Focusable {
 			this.selectedActiveSessionId = undefined;
 			return;
 		}
+		const selectedIdentity = this.selectedRowIdentity ?? this.persistentState.selectedRowIdentity;
 		const resolution = resolveAgentsViewSelectionState(
 			this.rows,
 			this.selectedIndex,
-			this.selectedRowIdentity ?? this.persistentState.selectedRowIdentity,
+			selectedIdentity,
 			this.selectedSessionKey ?? this.persistentState.selectedSessionKey,
 		);
 		this.selectedIndex = resolution.index;
@@ -2339,11 +2556,10 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 		this.stopped = true;
 		this.savedCatalogGeneration += 1;
-		this.liveCatalogGeneration += 1;
 		this.heartbeatCatalogGeneration += 1;
-		if (this.pollTimer) {
-			clearInterval(this.pollTimer);
-			this.pollTimer = undefined;
+		if (this.savedCatalogReconcileTimer) {
+			clearTimeout(this.savedCatalogReconcileTimer);
+			this.savedCatalogReconcileTimer = undefined;
 		}
 		if (this.heartbeatPollTimer) {
 			clearInterval(this.heartbeatPollTimer);
@@ -2365,7 +2581,8 @@ export class AgentsViewMode implements Component, Focusable {
 		this.unsubscribeClientClose = undefined;
 		this.unsubscribeClientMessage?.();
 		this.unsubscribeClientMessage = undefined;
-		this.client?.close();
+		this.unsubscribeRosterUpdate?.();
+		this.unsubscribeRosterUpdate = undefined;
 		this.client = undefined;
 		this.resolveRun?.(result);
 		this.resolveRun = undefined;
@@ -2417,16 +2634,17 @@ export class AgentsViewMode implements Component, Focusable {
 			try {
 				await this.options.recoverDaemon?.();
 				await client.reconnect(1000);
-				const response = await client.request(createAgentsViewListCommand());
-				const data = requireDaemonData(response);
-				const sessions = expectSessionList(data);
+				if (!this.rosterStore || !(await this.rosterStore.attach(client))) {
+					throw new Error("Daemon lost the agent_roster capability during reconnect");
+				}
 				const heartbeatsRefreshed = await this.refreshHeartbeats({ duringReconnect: true });
 				if (!heartbeatsRefreshed) throw new Error("Heartbeat catalog did not refresh during reconnect");
+				const sessions = this.rosterStore.summaries();
 				this.daemonShutdownReceived = false;
 				this.reconnectTimedOut = false;
 				this.setStatusMessage("Daemon reconnected", { render: false });
 				this.applySessionList(sessions, true);
-				void this.refreshSavedSessions({ duringReconnect: true, preserveStatusOnError: true });
+				this.armSavedSearchFetch({ duringReconnect: true });
 				return;
 			} catch (error) {
 				lastError = error;
@@ -2464,110 +2682,95 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private renderSessionRows(width: number, maxRows: number): string[] {
-		if (maxRows <= 0) {
-			return [];
+		if (maxRows <= 0) return [];
+		const layout = buildCompactAgentsViewLayout(this.rows, width);
+		const displayItems: DisplayItem[] = [];
+		const counts = countRowsBySection(this.rows);
+		for (const section of ["running", "idle", "inactive"] as const) {
+			if (counts[section] === 0) continue;
+			if (displayItems.length > 0) displayItems.push({ type: "spacer" });
+			displayItems.push({ type: "heading", section });
+			for (const row of getDisplayRowsForSection(this.rows, section)) {
+				displayItems.push({ type: "row", row });
+			}
 		}
-		if (this.rows.length === 0) {
-			return [theme.bold(sectionTitle("running")), theme.fg("dim", "  No sessions match your search.")].slice(
-				0,
-				maxRows,
-			);
+		if (displayItems.length === 0) {
+			const query =
+				this.replyTarget || this.renameTarget ? (this.actionModeSearchQuery ?? "") : this.editor.getText();
+			return [theme.fg("dim", query.trim() ? "No sessions match your search." : "No sessions yet.")];
 		}
-
-		const displayItems = buildDisplayItems(this.rows);
+		// Reserve the column header and its spacer, leaving at least one session row visible.
+		const headerRows = Math.min(2, maxRows - 1);
+		const visibleRows = maxRows - headerRows;
 		const selectedIdentity = this.rows[this.selectedIndex]?.identity;
 		const selectedDisplayIndex = displayItems.findIndex(
 			(item) => item.type === "row" && item.row.identity === selectedIdentity,
 		);
-		const visibleRows = Math.min(maxRows, this.visibleListRows());
 		const start = Math.max(
 			0,
 			Math.min(displayItems.length - visibleRows, selectedDisplayIndex - Math.floor(visibleRows / 2)),
 		);
-		const showLeadingEllipsis = start > 0;
-		let showTrailingEllipsis = start + visibleRows < displayItems.length;
-		if ((showLeadingEllipsis ? 1 : 0) + (showTrailingEllipsis ? 1 : 0) >= visibleRows) {
-			showTrailingEllipsis = false;
-		}
-		const contentVisibleRows = Math.max(
-			0,
-			visibleRows - (showLeadingEllipsis ? 1 : 0) - (showTrailingEllipsis ? 1 : 0),
-		);
-		const visibleItems = displayItems.slice(start, start + contentVisibleRows);
-		const lines = visibleItems.map((item) => {
-			if (item.type === "spacer") {
-				return "";
-			}
+		const showLeadingEllipsis = start > 0 && visibleRows > 1;
+		const showTrailingEllipsis = start + visibleRows < displayItems.length && visibleRows > 2;
+		const contentRows = visibleRows - Number(showLeadingEllipsis) - Number(showTrailingEllipsis);
+		const sliceStart = selectedDisplayIndex >= start + contentRows ? selectedDisplayIndex - contentRows + 1 : start;
+		const lines = displayItems.slice(sliceStart, sliceStart + contentRows).map((item) => {
+			if (item.type === "spacer") return "";
 			if (item.type === "heading") {
-				return theme.bold(sectionTitle(item.section));
+				return theme.fg("muted", truncateToWidth(`${sectionTitle(item.section)} (${counts[item.section]})`, width));
 			}
-			if (item.type === "empty") {
-				return theme.fg("dim", "  No agents");
-			}
-			return this.renderRow(item.row, width);
+			return this.renderRow(item.row, width, layout);
 		});
-		if (showLeadingEllipsis) {
-			lines.unshift(theme.fg("dim", "  ..."));
-		}
-		if (showTrailingEllipsis) {
-			lines.push(theme.fg("dim", "  ..."));
-		}
+		if (showLeadingEllipsis) lines.unshift(theme.fg("dim", "  ..."));
+		if (showTrailingEllipsis) lines.push(theme.fg("dim", "  ..."));
+		if (headerRows > 1) lines.unshift("");
+		if (headerRows > 0) lines.unshift(theme.bold(layout.legend));
 		return lines;
 	}
 
-	private renderRow(row: AgentsViewRow, width: number): string {
+	private renderRow(
+		row: AgentsViewRow,
+		width: number,
+		layout: AgentsViewUsageLayout = buildCompactAgentsViewLayout(this.rows.length > 0 ? this.rows : [row], width),
+	): string {
 		const selected = row.selectable && row.identity === this.rows[this.selectedIndex]?.identity;
-		if (row.kind === "subagent-code") {
-			return this.renderCodeRow(row);
-		}
+		const markRow = (line: string): string => (selected ? `${SELECTED_ROW_MARKER}${line}` : line);
+		if (row.kind === "subagent-code") return this.renderCodeRow(row);
 		if (row.kind === "subagent-summary") {
 			const indent = "  ".repeat(row.depth);
-			const hint = row.hasSpawnCode ? theme.fg("dim", ` · ${keyText("app.agents.program")} show program`) : "";
-			const label = `${theme.fg("dim", `${row.expanded ? "▾" : "▸"} ${row.title}`)}${hint}`;
-			const line = padLine(truncateToWidth(`${indent}${label}`, width, ""), width);
-			return selected ? `${SELECTED_ROW_MARKER}${line}` : line;
+			return markRow(formatTableCell(`${indent}${row.expanded ? "▾" : "▸"} ${row.title}`, width));
 		}
 		const pendingDelete = row.kind === "agent" && this.isPendingDeleteRow(row);
 		const pendingKill = row.kind === "subagent" && this.isPendingKillSubagentRow(row);
-		const rawIcon = this.getRowIcon(row.section);
-		const icon = this.formatRowIcon(row.section, rawIcon);
-		const indent = "  ".repeat(row.depth);
-		const age = formatSessionDuration(row.summary);
-		const details = row.section === "inactive" ? `${row.summary.messageCount} · ${age}` : age;
-		const detailsWidth = row.section === "inactive" ? Math.max(10, visibleWidth(details)) : 10;
-		const heartbeatBadge = !pendingDelete && !pendingKill ? formatHeartbeatBadge(row.heartbeat) : "";
-		const heartbeatCell = heartbeatBadge ? theme.fg("error", heartbeatBadge) : "";
-		const heartbeatWidth = visibleWidth(heartbeatBadge);
-		const titleWidth = Math.max(
-			0,
-			width -
-				visibleWidth(indent) -
-				visibleWidth(rawIcon) -
-				detailsWidth -
-				2 -
-				(heartbeatWidth > 0 ? heartbeatWidth + 1 : 0),
-		);
-		const title = pendingDelete
-			? this.getPendingDeleteTitle()
-			: pendingKill
-				? `${keyText("app.agents.delete")} again to ${row.section === "running" ? "stop" : "delete"}`
-				: styleRowTitle(row);
-		// Append the background summary as a dim suffix on the same line, e.g.
-		// "fix auth · Refactoring token validation". Hidden during delete/stop
-		// confirmations so the warning text stands alone.
-		const summaryText = !pendingDelete && !pendingKill ? row.summary.summary : undefined;
-		const titleContent = summaryText ? `${title} ${theme.fg("dim", `· ${summaryText}`)}` : title;
-		const titleCell = formatTableCell(titleContent, titleWidth);
+		const details = layout.details.get(row.identity) ?? "";
+		if (pendingDelete || pendingKill) {
+			const armed = row.summary.hasActiveHeartbeat === true || (row.heartbeat?.activeCount ?? 0) > 0;
+			const title =
+				(armed ? "has an armed heartbeat — " : "") +
+				(pendingDelete
+					? this.getPendingDeleteTitle()
+					: `${keyText("app.agents.delete")} again to ${hasLiveWork(row) ? "stop" : "delete"}`);
+			return markRow(formatTableCell(theme.fg("error", title), width));
+		}
+		const icon = this.formatRowIcon(row.section, this.getRowIcon(row.section));
+		const badge = formatHeartbeatBadge(row.heartbeat);
+		const heartbeat = badge ? `${theme.fg((row.heartbeat?.activeCount ?? 0) > 0 ? "error" : "dim", badge)} ` : "";
+		const title = `${"  ".repeat(row.depth)}${icon} ${heartbeat}${styleRowTitle(row)}`;
+		const status =
+			row.summary.lastHeardFromAt !== undefined
+				? getSessionStatusLabel(row.summary, row.heartbeat)
+				: row.summary.statusLabel !== undefined
+					? row.statusLabel
+					: undefined;
+		const activity = [status, row.summary.summary].filter(Boolean).join(" · ");
 		const cells = [
-			icon,
-			pendingDelete || pendingKill ? theme.fg("error", titleCell) : titleCell,
-			formatRightTableCell(details, detailsWidth),
+			formatTableCell(title, layout.nameWidth),
+			formatTableCell(theme.fg("muted", formatSessionModel(row)), layout.modelWidth),
 		];
-		const base = `${indent}${cells[0]} ${heartbeatCell ? `${heartbeatCell} ` : ""}${cells[1]} ${cells[2]}`;
-		const line = padLine(truncateToWidth(base, width, ""), width);
-		return selected ? `${SELECTED_ROW_MARKER}${line}` : line;
+		if (layout.activityWidth > 0) cells.push(formatTableCell(theme.fg("dim", activity), layout.activityWidth));
+		cells.push(theme.fg("dim", details));
+		return markRow(formatTableCell(cells.join("  "), width));
 	}
-
 	// Spawn-code rows are read-only context. They render deemphasized — muted
 	// text on a panel background (applied in finalizeRenderedLine) so the program
 	// reads as one quiet segmented block rather than competing with agent rows.
@@ -2623,7 +2826,14 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private renderPrompt(width: number): string[] {
-		return this.editor.render(width);
+		const inline = !this.replyTarget && !this.renameTarget;
+		// A transparent surface preserves the editor's padding, scroll hints, and cursor without input chrome.
+		this.editor.backgroundColor = inline ? (text) => text : theme.getEditorBackgroundColor();
+		const lines = this.editor.render(width);
+		if (!inline) return lines;
+		return lines
+			.filter((line, index) => (index > 0 && index < lines.length - 1) || line.trim().length > 0)
+			.map((line) => theme.fg("muted", line));
 	}
 
 	private renderDock(width: number): string[] {
@@ -2647,29 +2857,15 @@ export class AgentsViewMode implements Component, Focusable {
 		if (this.replyTarget) {
 			return truncateToWidth(theme.fg("muted", this.renderReplyComposerHints()), width);
 		}
-		// Replying is reserved for top-level agents; subagents can be stopped or deleted.
-		const selectedRow = this.rows[this.selectedIndex];
-		const selectedAgent = selectedRow?.kind === "agent";
-		const selectedSubagent = selectedRow?.kind === "subagent";
-		const selectedSummary = selectedRow?.kind === "subagent-summary";
+		const selected = this.rows[this.selectedIndex];
+		// Enter and Right both toggle the list on a summary row and open everywhere
+		// else; Left only has a parent scope to return to below the root view.
+		const rightAction = selected?.kind === "subagent-summary" ? (selected.expanded ? "collapse" : "expand") : "open";
 		const hints = [
-			`${keyText("tui.select.up")}/${keyText("tui.select.down")} move`,
-			selectedSummary
-				? `${keyText("tui.select.confirm")} ${selectedRow?.expanded ? "collapse" : "expand"}`
-				: `${keyText("tui.select.confirm")} open`,
-			selectedSummary ? undefined : `${keyText("app.agents.open")} open`,
-			selectedAgent
-				? `${keyText("app.agents.reply")} ${selectedRow?.section === "inactive" ? "resume" : "reply"}`
-				: undefined,
+			`${keyText("tui.select.up")}/${keyText("tui.select.down")} navigate`,
+			`${keyText("tui.select.confirm")}/${keyText("app.agents.open")} ${rightAction}`,
+			this.scopeRootSummary ? `${keyText("app.agents.back")} parent` : undefined,
 			`${keyText("app.agents.new")} new`,
-			selectedAgent ? `${keyText("app.agents.rename")} rename` : undefined,
-			selectedAgent
-				? `${keyText("app.agents.delete")} ${selectedRow?.section === "inactive" ? "delete" : "stop/deactivate"}`
-				: undefined,
-			selectedSubagent
-				? `${keyText("app.agents.delete")} ${selectedRow.section === "running" ? "stop" : "delete"}`
-				: undefined,
-			this.selectedRowCanShowProgram() ? `${keyText("app.agents.program")} program` : undefined,
 		]
 			.filter((hint): hint is string => hint !== undefined)
 			.join("   ");
@@ -2702,11 +2898,8 @@ export class AgentsViewMode implements Component, Focusable {
 		return Math.max(0, rows - dockHeight);
 	}
 
-	private getSplashModelId(): string | undefined {
-		return this.rows[this.selectedIndex]?.summary.model?.id ?? this.options.startupModelId;
-	}
-
-	private getSplashCwd(): string {
+	private getSplashCwd(): string | undefined {
+		if (this.scopeRootSummary) return undefined;
 		return this.rows[this.selectedIndex]?.summary.cwd ?? this.options.uiServices.getInitialCwd();
 	}
 
@@ -2715,9 +2908,8 @@ export class AgentsViewMode implements Component, Focusable {
 			case "running":
 				return workingIconFrame(this.workingIconFrame);
 			case "idle":
-				return NEEDS_INPUT_ROW_ICON;
 			case "inactive":
-				return COMPLETED_ROW_ICON;
+				return STATUS_ROW_ICON;
 			default: {
 				const _exhaustive: never = section;
 				return _exhaustive;
@@ -2730,9 +2922,9 @@ export class AgentsViewMode implements Component, Focusable {
 			case "running":
 				return theme.bold(icon);
 			case "idle":
-				return theme.fg("warning", icon);
+				return theme.bold(theme.fg("warning", icon));
 			case "inactive":
-				return theme.fg("dim", icon);
+				return theme.bold(theme.fg("dim", icon));
 			default: {
 				const _exhaustive: never = section;
 				return _exhaustive;
@@ -2744,28 +2936,7 @@ export class AgentsViewMode implements Component, Focusable {
 type DisplayItem =
 	| { type: "spacer" }
 	| { type: "heading"; section: AgentsViewSection }
-	| { type: "empty"; section: AgentsViewSection }
 	| { type: "row"; row: AgentsViewRow };
-
-function buildDisplayItems(rows: readonly AgentsViewRow[]): DisplayItem[] {
-	const items: DisplayItem[] = [];
-	const sections: AgentsViewSection[] = ["running", "idle", "inactive"];
-	for (const [index, section] of sections.entries()) {
-		if (index > 0) {
-			items.push({ type: "spacer" });
-		}
-		items.push({ type: "heading", section });
-		const sectionRows = getDisplayRowsForSection(rows, section);
-		if (sectionRows.length === 0) {
-			items.push({ type: "empty", section });
-			continue;
-		}
-		for (const row of sectionRows) {
-			items.push({ type: "row", row });
-		}
-	}
-	return items;
-}
 
 // Nested rows (subagent summaries and expanded subagents) always render in
 // their top-level agent's section block, regardless of their own section.
@@ -2801,8 +2972,49 @@ function rowHasSpawnCode(row: AgentsViewRow): boolean {
 	return typeof code === "string" && code.trim().length > 0;
 }
 
-function isRunningSessionSummary(summary: SessionSummary): boolean {
-	return summary.activity === "working";
+// Destructive actions gate on live work anywhere in the subtree, never on the display section.
+function hasLiveWork(row: AgentsViewRow): boolean {
+	return row.section === "running" || row.runningSubagentCount > 0 || row.summary.hasRunningRlmChildren === true;
+}
+
+export interface AgentsViewUsageLayout {
+	legend: string;
+	details: ReadonlyMap<string, string>;
+	nameWidth: number;
+	modelWidth: number;
+	activityWidth: number;
+}
+
+export function buildCompactAgentsViewLayout(rows: readonly AgentsViewRow[], width = 120): AgentsViewUsageLayout {
+	const sessions = rows.filter((row) => row.kind === "agent" || row.kind === "subagent");
+	const entries = sessions.map((row) => ({
+		identity: row.identity,
+		cost: `$${row.recursiveCost.toFixed(2)}`,
+		age: formatSessionDuration(row.summary),
+	}));
+	const costWidth = entries.reduce((size, entry) => Math.max(size, visibleWidth(entry.cost)), 4);
+	const ageWidth = entries.reduce((size, entry) => Math.max(size, visibleWidth(entry.age)), 3);
+	const detailsWidth = costWidth + 2 + ageWidth;
+	const available = Math.max(0, width - detailsWidth - 4);
+	const desiredModelWidth = sessions.reduce((size, row) => Math.max(size, visibleWidth(formatSessionModel(row))), 12);
+	const modelWidth = Math.min(desiredModelWidth, 32, Math.max(0, available - 12));
+	const nameWidth = Math.min(28, Math.max(0, available - modelWidth));
+	const activityWidth = Math.max(0, available - modelWidth - nameWidth - 2);
+	const detailLine = (cost: string, age: string) => `${padCellStart(cost, costWidth)}  ${padCellStart(age, ageWidth)}`;
+	const headings = [formatTableCell("Session", nameWidth), formatTableCell("Model", modelWidth)];
+	if (activityWidth > 0) headings.push(formatTableCell("Activity", activityWidth));
+	headings.push(detailLine("Cost", "Age"));
+	return {
+		legend: formatTableCell(headings.join("  "), width),
+		details: new Map(entries.map((entry) => [entry.identity, detailLine(entry.cost, entry.age)])),
+		nameWidth,
+		modelWidth,
+		activityWidth,
+	};
+}
+
+function padCellStart(value: string, width: number): string {
+	return " ".repeat(Math.max(0, width - visibleWidth(value))) + value;
 }
 
 // Explicit session names read bold so they stand out from fallback titles
@@ -2822,9 +3034,16 @@ function formatTableCell(value: string, width: number): string {
 	return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
 }
 
-function formatRightTableCell(value: string, width: number): string {
-	const truncated = truncateToWidth(value, width, "");
-	return " ".repeat(Math.max(0, width - visibleWidth(truncated))) + truncated;
+// Model ids can embed a provider path ("moonshotai/kimi-k2"); the column shows
+// the bare model name plus the thinking level ("kimi-k2:high") when one is
+// active — "off" reads as noise, so it and absent levels render bare (saved
+// rows carry no level).
+function formatSessionModel(row: AgentsViewRow): string {
+	const id = row.summary.model?.id ?? row.record?.saved?.model?.modelId;
+	if (!id) return "-";
+	const bare = id.slice(id.lastIndexOf("/") + 1) || id;
+	const level = row.summary.thinkingLevel;
+	return level && level !== "off" ? `${bare}:${level}` : bare;
 }
 
 function formatSessionDuration(summary: SessionSummary): string {

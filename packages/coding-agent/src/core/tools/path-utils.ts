@@ -1,6 +1,6 @@
 import { accessSync, constants } from "node:fs";
 import * as os from "node:os";
-import { isAbsolute, resolve as resolvePath } from "node:path";
+import { isAbsolute, posix, resolve as resolvePath, win32 } from "node:path";
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 const NARROW_NO_BREAK_SPACE = "\u202F";
@@ -36,13 +36,13 @@ function normalizeAtPrefix(filePath: string): string {
 	return filePath.startsWith("@") ? filePath.slice(1) : filePath;
 }
 
-export function expandPath(filePath: string): string {
+export function expandPath(filePath: string, platform: NodeJS.Platform = process.platform): string {
 	const normalized = normalizeUnicodeSpaces(normalizeAtPrefix(filePath));
 	if (normalized === "~") {
 		return os.homedir();
 	}
-	if (normalized.startsWith("~/")) {
-		return os.homedir() + normalized.slice(1);
+	if (normalized.startsWith("~/") || (platform === "win32" && normalized.startsWith("~\\"))) {
+		return (platform === "win32" ? win32 : posix).join(os.homedir(), normalized.slice(2));
 	}
 	return normalized;
 }
@@ -66,25 +66,21 @@ export function resolveReadPath(filePath: string, cwd: string): string {
 		return resolved;
 	}
 
-	// Try macOS AM/PM variant (narrow no-break space before AM/PM)
 	const amPmVariant = tryMacOSScreenshotPath(resolved);
 	if (amPmVariant !== resolved && fileExists(amPmVariant)) {
 		return amPmVariant;
 	}
 
-	// Try NFD variant (macOS stores filenames in NFD form)
 	const nfdVariant = tryNFDVariant(resolved);
 	if (nfdVariant !== resolved && fileExists(nfdVariant)) {
 		return nfdVariant;
 	}
 
-	// Try curly quote variant (macOS uses U+2019 in screenshot names)
 	const curlyVariant = tryCurlyQuoteVariant(resolved);
 	if (curlyVariant !== resolved && fileExists(curlyVariant)) {
 		return curlyVariant;
 	}
 
-	// Try combined NFD + curly quote (for French macOS screenshots like "Capture d'écran")
 	const nfdCurlyVariant = tryCurlyQuoteVariant(nfdVariant);
 	if (nfdCurlyVariant !== resolved && fileExists(nfdCurlyVariant)) {
 		return nfdCurlyVariant;

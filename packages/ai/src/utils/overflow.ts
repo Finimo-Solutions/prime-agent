@@ -15,6 +15,7 @@ import type { AssistantMessage } from "../types.js";
  * - xAI: "This model's maximum prompt length is 131072 but the request contains 537812 tokens"
  * - Groq: "Please reduce the length of the messages or completion"
  * - OpenRouter: "This endpoint's maximum context length is X tokens. However, you requested about Y tokens"
+ * - LiteLLM: "Requested token count exceeds the model's maximum context length of X tokens"
  * - llama.cpp: "the request exceeds the available context size, try increasing it"
  * - LM Studio: "tokens to keep from the initial prompt is greater than the context length"
  * - GitHub Copilot: "prompt token count of X exceeds the limit of Y"
@@ -37,6 +38,7 @@ const OVERFLOW_PATTERNS = [
 	/maximum prompt length is \d+/i, // xAI (Grok)
 	/reduce the length of the messages/i, // Groq
 	/maximum context length is \d+ tokens/i, // OpenRouter (all backends)
+	/exceeds the model's maximum context length/i, // LiteLLM (input + requested output)
 	/exceeds the limit of \d+/i, // GitHub Copilot
 	/exceeds the available context size/i, // llama.cpp server
 	/greater than the context length/i, // LM Studio
@@ -86,6 +88,7 @@ const NON_OVERFLOW_PATTERNS = [
  * - Cerebras: 400/413 status code (no body)
  * - Mistral: "Prompt contains X tokens ... too large for model with Y maximum context length"
  * - OpenRouter (all backends): "maximum context length is X tokens"
+ * - LiteLLM: "exceeds the model's maximum context length of X tokens"
  * - llama.cpp: "exceeds the available context size"
  * - LM Studio: "greater than the context length"
  * - Kimi For Coding: "exceeded model token limit: X (requested: Y)"
@@ -115,7 +118,6 @@ const NON_OVERFLOW_PATTERNS = [
  * @returns true if the message indicates a context overflow
  */
 export function isContextOverflow(message: AssistantMessage, contextWindow?: number): boolean {
-	// Case 1: Check error message patterns
 	if (message.stopReason === "error" && message.errorMessage) {
 		// Skip messages matching known non-overflow patterns (e.g. throttling / rate-limit)
 		const isNonOverflow = NON_OVERFLOW_PATTERNS.some((p) => p.test(message.errorMessage!));
@@ -124,7 +126,6 @@ export function isContextOverflow(message: AssistantMessage, contextWindow?: num
 		}
 	}
 
-	// Case 2: Silent overflow (z.ai style) - successful but usage exceeds context
 	if (contextWindow && message.stopReason === "stop") {
 		const inputTokens = message.usage.input + message.usage.cacheRead;
 		if (inputTokens > contextWindow) {
@@ -143,11 +144,4 @@ export function isContextOverflow(message: AssistantMessage, contextWindow?: num
 	}
 
 	return false;
-}
-
-/**
- * Get the overflow patterns for testing purposes.
- */
-export function getOverflowPatterns(): RegExp[] {
-	return [...OVERFLOW_PATTERNS];
 }

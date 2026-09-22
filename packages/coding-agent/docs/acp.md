@@ -20,6 +20,7 @@ Use ACP mode when something external needs to *drive* a session interactively: p
 |---|---|
 | `initialize` | Returns protocol version, capabilities, and agent info. |
 | `session/new` | Creates the session. One session per connection. |
+| `session/set_config_option` | Changes the model or reasoning effort and returns all current options. |
 | `session/prompt` | Runs one turn and resolves with a stop reason. |
 | `session/cancel` | Notification; aborts the addressed session's turn. |
 | `session/close` | Releases the session and frees the connection for a new one. |
@@ -27,6 +28,38 @@ Use ACP mode when something external needs to *drive* a session interactively: p
 One session per connection is a deliberate limit: Prime Agent's underlying session is fixed at process startup, so a second concurrent session would silently share its conversation, working directory, and model. A second `session/new` is refused rather than pretending to isolate. Start another process for a second session.
 
 Likewise `session/prompt` refuses a concurrent turn while one is running, and the working directory cannot be changed after startup — a client-supplied `cwd` that differs from the agent's real one is reported back in `_meta` rather than silently ignored.
+
+## Model and reasoning effort pickers
+
+`session/new` returns standard ACP `configOptions`, allowing clients such as Zed to display a model picker and a reasoning effort picker. Models come from providers configured in Prime Agent. Model values are opaque IDs encoding the provider and model ID as a JSON pair; clients should send the advertised value unchanged. The current model is included and can be reselected even if model discovery is unavailable.
+
+The effort picker uses the `thought_level` category and contains only levels supported by the selected model. It is omitted for models without reasoning support. Changing models returns updated effort options and the effective level after Prime Agent applies its model-specific limits. Changes use the same session and saved preferences as Prime Agent's own model and effort controls.
+
+Clients change selections with `session/set_config_option`, using `configId: "model"` or `configId: "thought_level"`. Unsupported values are rejected. `config_option_update` notifications keep the client synchronized with observed session configuration changes.
+
+## MCP servers
+
+Prime Agent accepts standard stdio and HTTP servers in `session/new.mcpServers`. The servers are
+available through the pre-imported `mcp` Python program for that ACP session:
+
+```python
+tools = await mcp.list_tools("task-tools")
+result = await mcp.call_tool("task-tools", "lookup", {"query": "example"})
+```
+
+HTTP requests use only the URL and headers supplied by the ACP client. They do not read
+`auth.json`, start or refresh Prime Agent OAuth, or modify persistent MCP settings. Stdio servers
+run with the agent's actual session cwd, the supplied command and arguments, a scrubbed base
+environment, and the exact environment values supplied by the ACP client.
+
+The configuration is removed when the ACP session closes or the client disconnects. A same-named
+persistent MCP server can therefore be shadowed for the ACP session without sending its stored
+OAuth credential to the client-supplied HTTP endpoint. Daemon-backed configuration is bound to the
+ACP connection that installed it, so another attached client cannot replace or clear it.
+
+ACP stdio is a trusted-code boundary, not a sandbox. The requested command runs as the Prime Agent
+user and can access any files that user can access, including credential stores. Only accept stdio
+servers from trusted ACP clients or run Prime Agent inside an appropriate sandbox.
 
 ## Streamed updates
 
@@ -40,11 +73,11 @@ Session activity arrives as `session/update` notifications:
 | tool finishes | `tool_call_update` (`completed` / `failed`) |
 | shell output | `tool_call` plus incremental `tool_call_update` |
 
-IPython is Prime Agent's model-facing tool, so a cell is a `tool_call` of kind `execute` whose `rawInput` carries the cell source.
+The Python REPL is Prime Agent's model-facing tool, so a cell is a `tool_call` of kind `execute` whose `rawInput` carries the cell source.
 
 ## Prime Agent extensions
 
-Prime Agent has capabilities ACP has no field for: subagents, autonomous quality gates, goals, heartbeats, continual-harness refinement, compaction, and rich IPython output. These travel in a reverse-domain `_meta` envelope:
+Prime Agent has capabilities ACP has no field for: subagents, autonomous quality gates, goals, heartbeats, continual-harness refinement, compaction, and rich kernel output. These travel in a reverse-domain `_meta` envelope:
 
 ```json
 {

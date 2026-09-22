@@ -14,14 +14,11 @@ export function buildBaseOptions(model: Model<Api>, options?: SimpleStreamOption
 		onPayload: options?.onPayload,
 		onResponse: options?.onResponse,
 		timeoutMs: options?.timeoutMs,
-		maxRetries: options?.maxRetries,
-		maxRetryDelayMs: options?.maxRetryDelayMs,
 		metadata: options?.metadata,
 	};
 }
 
 export function clampReasoning(effort: ThinkingLevel | undefined): Exclude<ThinkingLevel, "xhigh" | "max"> | undefined {
-	// Token-budget providers have no distinct xhigh/max budget tier; clamp both to high.
 	return effort === "xhigh" || effort === "max" ? "high" : effort;
 }
 
@@ -40,12 +37,16 @@ export function adjustMaxTokensForThinking(
 	const budgets = { ...defaultBudgets, ...customBudgets };
 
 	const minOutputTokens = 1024;
+	const minThinkingTokens = 1024;
 	const level = clampReasoning(reasoningLevel)!;
-	let thinkingBudget = budgets[level]!;
+	let thinkingBudget = Math.max(minThinkingTokens, budgets[level]!);
 	const maxTokens = Math.min(baseMaxTokens + thinkingBudget, modelMaxTokens);
+	if (maxTokens <= minThinkingTokens) {
+		throw new Error("Budget-based thinking requires at least 1024 thinking tokens plus room for the response");
+	}
 
 	if (maxTokens <= thinkingBudget) {
-		thinkingBudget = Math.max(0, maxTokens - minOutputTokens);
+		thinkingBudget = Math.max(minThinkingTokens, maxTokens - minOutputTokens);
 	}
 
 	return { maxTokens, thinkingBudget };

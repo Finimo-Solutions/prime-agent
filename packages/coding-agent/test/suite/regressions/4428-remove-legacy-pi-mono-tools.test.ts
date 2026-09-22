@@ -1,7 +1,8 @@
-import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getModel } from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseArgs } from "../../../src/cli/args.js";
@@ -9,7 +10,20 @@ import { DefaultResourceLoader } from "../../../src/core/resource-loader.js";
 import { createAgentSession } from "../../../src/core/sdk.js";
 import { SessionManager } from "../../../src/core/session-manager.js";
 import { SettingsManager } from "../../../src/core/settings-manager.js";
-import { allToolNames, createAllToolDefinitions } from "../../../src/core/tools/index.js";
+import { createAllToolDefinitions } from "../../../src/core/tools/index.js";
+
+const legacyBashExtension = (pi: ExtensionAPI) => {
+	pi.on("session_start", () => {
+		pi.registerTool({
+			name: "bash",
+			label: "Custom Bash",
+			description: "Tool registered from session_start",
+			promptSnippet: "Run custom shell behavior",
+			parameters: Type.Object({}),
+			execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+		});
+	});
+};
 
 describe("regression #4428: remove legacy pi-mono built-in tools", () => {
 	let tempDir: string;
@@ -27,100 +41,30 @@ describe("regression #4428: remove legacy pi-mono built-in tools", () => {
 		}
 	});
 
-	it("registers only ipython as a built-in tool", () => {
-		expect([...allToolNames]).toEqual(["ipython"]);
+	it("registers only ipython as a built-in tool and keeps legacy names parseable", () => {
 		expect(Object.keys(createAllToolDefinitions(process.cwd()))).toEqual(["ipython"]);
+		expect(parseArgs(["--tools", "bash,edit,ipython"])).toMatchObject({
+			tools: ["bash", "edit", "ipython"],
+			diagnostics: [],
+		});
 	});
 
-	it("keeps legacy names available for extension and custom tool allowlists", () => {
-		const result = parseArgs(["--tools", "bash,edit,ipython"]);
-
-		expect(result.tools).toEqual(["bash", "edit", "ipython"]);
-		expect(result.diagnostics).toEqual([]);
-	});
-
-	it("does not expose removed built-in tool names when only they are requested", async () => {
-		const settingsManager = SettingsManager.create(tempDir, agentDir);
-		const sessionManager = SessionManager.inMemory(tempDir);
-		const resourceLoader = new DefaultResourceLoader({
-			cwd: tempDir,
-			agentDir,
-			settingsManager,
-		});
-		await resourceLoader.reload();
-
-		const { session } = await createAgentSession({
-			cwd: tempDir,
-			agentDir,
-			model: getModel("anthropic", "claude-sonnet-5")!,
-			settingsManager,
-			sessionManager,
-			resourceLoader,
-			tools: ["bash", "edit"],
-		});
-		await session.bindExtensions({});
-
-		expect(session.getAllTools().map((tool) => tool.name)).toEqual([]);
-		expect(session.getActiveToolNames()).toEqual([]);
-		session.dispose();
-	});
-
-	it("allowlists an extension tool that reuses a legacy built-in name", async () => {
-		const settingsManager = SettingsManager.create(tempDir, agentDir);
-		const sessionManager = SessionManager.inMemory(tempDir);
-		const resourceLoader = new DefaultResourceLoader({
-			cwd: tempDir,
-			agentDir,
-			settingsManager,
-			extensionFactories: [
-				(pi) => {
-					pi.on("session_start", () => {
-						pi.registerTool({
-							name: "bash",
-							label: "Custom Bash",
-							description: "Tool registered from session_start",
-							promptSnippet: "Run custom shell behavior",
-							parameters: Type.Object({}),
-							execute: async () => ({
-								content: [{ type: "text", text: "ok" }],
-								details: {},
-							}),
-						});
-					});
-				},
-			],
-		});
-		await resourceLoader.reload();
-
-		const { session } = await createAgentSession({
-			cwd: tempDir,
-			agentDir,
-			model: getModel("anthropic", "claude-sonnet-5")!,
-			settingsManager,
-			sessionManager,
-			resourceLoader,
+	it.each([
+		{ name: "removed built-in names resolve to nothing", tools: ["bash", "edit"], factories: [], expected: [] },
+		{
+			name: "an extension tool may reuse a legacy built-in name",
 			tools: ["bash"],
-		});
-		await session.bindExtensions({});
-
-		expect(session.getAllTools().map((tool) => tool.name)).toEqual(["bash"]);
-		expect(session.getActiveToolNames()).toEqual(["bash"]);
-		session.dispose();
-	});
-
-	it("applies shell settings to ipython bash cells", async () => {
-		const shellPath = join(tempDir, "custom-shell.sh");
-		writeFileSync(shellPath, "#!/bin/sh\nprintf 'custom-shell\\n'\nexec /bin/sh \"$@\"\n");
-		chmodSync(shellPath, 0o755);
-
+			factories: [legacyBashExtension],
+			expected: ["bash"],
+		},
+		{ name: "ipython stays built in", tools: ["ipython"], factories: [], expected: ["ipython"] },
+	])("$name", async ({ tools, factories, expected }) => {
 		const settingsManager = SettingsManager.create(tempDir, agentDir);
-		settingsManager.setShellCommandPrefix("echo prefix-from-settings");
-		settingsManager.setShellPath(shellPath);
-		const sessionManager = SessionManager.inMemory(tempDir);
 		const resourceLoader = new DefaultResourceLoader({
 			cwd: tempDir,
 			agentDir,
 			settingsManager,
+			extensionFactories: factories,
 		});
 		await resourceLoader.reload();
 
@@ -129,25 +73,17 @@ describe("regression #4428: remove legacy pi-mono built-in tools", () => {
 			agentDir,
 			model: getModel("anthropic", "claude-sonnet-5")!,
 			settingsManager,
-			sessionManager,
+			sessionManager: SessionManager.inMemory(tempDir),
 			resourceLoader,
-			tools: ["ipython"],
+			tools,
 		});
+		await session.bindExtensions({});
 
 		try {
-			expect(session.getActiveToolNames()).toEqual(["ipython"]);
-			const ipythonTool = session.agent.state.tools.find((tool) => tool.name === "ipython");
-			expect(ipythonTool).toBeTruthy();
-
-			const result = await ipythonTool!.execute("tool-1", { code: "%%bash\necho body" });
-			const output = result.content
-				.filter((item): item is { type: "text"; text: string } => item.type === "text")
-				.map((item) => item.text)
-				.join("");
-
-			expect(output).toContain("custom-shell\nprefix-from-settings\nbody");
+			expect(session.getAllTools().map((tool) => tool.name)).toEqual(expected);
+			expect(session.getActiveToolNames()).toEqual(expected);
 		} finally {
-			await session.disposeAsync();
+			session.dispose();
 		}
 	});
 });

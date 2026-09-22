@@ -1,7 +1,4 @@
-/**
- * GitHub Copilot OAuth flow
- */
-
+import { COPILOT_CLIENT_HEADERS, COPILOT_CLIENT_USER_AGENT } from "../../copilot-client-version.js";
 import { getModels } from "../../models.js";
 import type { Api, Model } from "../../types.js";
 import type { OAuthCredentials, OAuthLoginCallbacks, OAuthProviderInterface } from "./types.js";
@@ -13,12 +10,7 @@ type CopilotCredentials = OAuthCredentials & {
 const decode = (s: string) => atob(s);
 const CLIENT_ID = decode("SXYxLmI1MDdhMDhjODdlY2ZlOTg=");
 
-const COPILOT_HEADERS = {
-	"User-Agent": "GitHubCopilotChat/0.35.0",
-	"Editor-Version": "vscode/1.107.0",
-	"Editor-Plugin-Version": "copilot-chat/0.35.0",
-	"Copilot-Integration-Id": "vscode-chat",
-} as const;
+const COPILOT_HEADERS = COPILOT_CLIENT_HEADERS;
 
 const INITIAL_POLL_INTERVAL_MULTIPLIER = 1.2;
 const SLOW_DOWN_POLL_INTERVAL_MULTIPLIER = 1.4;
@@ -75,18 +67,15 @@ function getBaseUrlFromToken(token: string): string | null {
 	const match = token.match(/proxy-ep=([^;]+)/);
 	if (!match) return null;
 	const proxyHost = match[1];
-	// Convert proxy.xxx to api.xxx
 	const apiHost = proxyHost.replace(/^proxy\./, "api.");
 	return `https://${apiHost}`;
 }
 
 export function getGitHubCopilotBaseUrl(token?: string, enterpriseDomain?: string): string {
-	// If we have a token, extract the base URL from proxy-ep
 	if (token) {
 		const urlFromToken = getBaseUrlFromToken(token);
 		if (urlFromToken) return urlFromToken;
 	}
-	// Fallback for enterprise or if token parsing fails
 	if (enterpriseDomain) return `https://copilot-api.${enterpriseDomain}`;
 	return "https://api.individual.githubcopilot.com";
 }
@@ -107,7 +96,7 @@ async function startDeviceFlow(domain: string): Promise<DeviceCodeResponse> {
 		headers: {
 			Accept: "application/json",
 			"Content-Type": "application/x-www-form-urlencoded",
-			"User-Agent": "GitHubCopilotChat/0.35.0",
+			"User-Agent": COPILOT_CLIENT_USER_AGENT,
 		},
 		body: new URLSearchParams({
 			client_id: CLIENT_ID,
@@ -144,9 +133,6 @@ async function startDeviceFlow(domain: string): Promise<DeviceCodeResponse> {
 	};
 }
 
-/**
- * Sleep that can be interrupted by an AbortSignal
- */
 function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
 	return new Promise((resolve, reject) => {
 		if (signal?.aborted) {
@@ -194,7 +180,7 @@ async function pollForGitHubAccessToken(
 			headers: {
 				Accept: "application/json",
 				"Content-Type": "application/x-www-form-urlencoded",
-				"User-Agent": "GitHubCopilotChat/0.35.0",
+				"User-Agent": COPILOT_CLIENT_USER_AGENT,
 			},
 			body: new URLSearchParams({
 				client_id: CLIENT_ID,
@@ -235,9 +221,6 @@ async function pollForGitHubAccessToken(
 	throw new Error("Device flow timed out");
 }
 
-/**
- * Refresh GitHub Copilot token
- */
 export async function refreshGitHubCopilotToken(
 	refreshToken: string,
 	enterpriseDomain?: string,
@@ -359,7 +342,6 @@ export async function loginGitHubCopilot(options: {
 	);
 	const credentials = await refreshGitHubCopilotToken(githubAccessToken, enterpriseDomain ?? undefined);
 
-	// Enable all models after successful login
 	options.onProgress?.("Enabling models...");
 	await enableAllGitHubCopilotModels(credentials.access, enterpriseDomain ?? undefined);
 	return credentials;

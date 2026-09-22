@@ -1,5 +1,8 @@
 import chalk from "chalk";
 import { APP_NAME, SELF_UPDATE_INTERACTIVE_CHILD_ENV } from "../config.js";
+import { AuthStorage } from "../core/auth-storage.js";
+import { runMcpManagementCommand } from "../core/mcp/mcp-command.js";
+import { SettingsManager } from "../core/settings-manager.js";
 import { handlePackageCommand, isSelfUpdateSource } from "../package-manager-cli.js";
 import { INTERNAL_RUNTIME_COMMAND_MARKER, parseArgs } from "./args.js";
 import {
@@ -15,6 +18,7 @@ import {
 import { handleDaemonCommand } from "./daemon-command.js";
 import { runPs, runReap, runShutdownAll } from "./daemon-ps.js";
 import { DAEMON_UPDATE_RESTART_COORDINATOR_FLAG } from "./daemon-update-restart.js";
+import { extractHelpCommandPath, rotateGlobalFlagsBeforeCommand } from "./global-flags.js";
 
 export interface PublicCommandResult {
 	handled: boolean;
@@ -34,9 +38,13 @@ export async function handlePublicCommand(args: string[]): Promise<PublicCommand
 }
 
 async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
-	args = normalizeLeadingDaemonSocketOption(args);
-	if (args[0] === "help" && isHelpCommandRequest(args.slice(1))) {
-		return printRequestedHelp(args.slice(1));
+	args = rotateGlobalFlagsBeforeCommand(args);
+	// Global run flags are excluded from the help request, not forwarded as help
+	// arguments: `prime-agent --offline help` must print help, not chat the
+	// rotated argv to the model.
+	const helpPath = args[0] === "help" ? extractHelpCommandPath(args, 1) : undefined;
+	if (helpPath !== undefined && isHelpCommandRequest(helpPath)) {
+		return printRequestedHelp(helpPath);
 	}
 
 	const command = args[0];
@@ -109,6 +117,8 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 			return runShutdown(args.slice(1));
 		case "package":
 			return runPackage(args.slice(1));
+		case "mcp":
+			return runMcp(args.slice(1));
 		case "update": {
 			const rest = args.slice(1);
 			const hasLegacySelfTarget = rest.some((arg) => arg === "--self" || isSelfUpdateSource(arg));
@@ -128,7 +138,11 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 			if (hasLegacyPackageTarget) {
 				return fail("Package updates moved to the package command.", `Use "${APP_NAME} package update [source]".`);
 			}
-			const options = parseBooleanOptions(rest, new Set(["--force"]), "update");
+			const options = parseBooleanOptions(
+				rest,
+				new Set(["--force", "--rollback", "--nightly", "--stable"]),
+				"update",
+			);
 			if (!options) return HANDLED;
 			await handlePackageCommand(["update", "--self", ...options]);
 			return HANDLED;
@@ -143,19 +157,6 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 		default:
 			return continueWith(args);
 	}
-}
-
-function normalizeLeadingDaemonSocketOption(args: string[]): string[] {
-	const option = args[0];
-	if (option !== "--daemon-socket") {
-		return args;
-	}
-	const socketPath = args[1];
-	const command = args[2];
-	if (socketPath === undefined || (command !== "stop" && command !== "rename")) {
-		return args;
-	}
-	return [command, ...args.slice(3), option, socketPath];
 }
 
 function continueWith(args: string[]): PublicCommandResult {
@@ -262,6 +263,13 @@ async function runShutdown(args: string[]): Promise<PublicCommandResult> {
 	const options = parseBooleanOptions(args, new Set(["--force", "--json"]), "shutdown");
 	if (!options) return HANDLED;
 	await runShutdownAll(options.has("--json"), options.has("--force"));
+	return HANDLED;
+}
+
+async function runMcp(args: string[]): Promise<PublicCommandResult> {
+	const settingsManager = SettingsManager.create(process.cwd());
+	const result = await runMcpManagementCommand(args, settingsManager, AuthStorage.create());
+	console.log(result.message);
 	return HANDLED;
 }
 

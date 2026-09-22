@@ -1,9 +1,11 @@
 import type { ServiceTier, Transport } from "@earendil-works/pi-ai";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
+import { writeFileAtomicSync } from "../utils/atomic-file.js";
+import type { ProviderWaitPolicy } from "./provider-retry.js";
 
 const RECENT_MODELS_LIMIT = 20;
 export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
@@ -27,10 +29,19 @@ export interface AutoRefineSettings {
 	cooldownMs?: number; // default: 20 minutes
 }
 
+export interface ProviderWaitSettings {
+	enabled?: boolean; // default: true - bounded wait for quota/unavailability recovery
+	baseDelayMs?: number; // default: 1000 (first ping delay)
+	maxDelayMs?: number; // default: 300000 (per-ping ceiling, 5m)
+	maxAttempts?: number; // default: 30 (abort bound: max pings)
+	maxWaitMs?: number; // default: 900000 (abort bound: max total wait, 15m)
+}
+
 export interface ProviderRetrySettings {
 	timeoutMs?: number; // SDK/provider request timeout in milliseconds
-	maxRetries?: number; // SDK/provider retry attempts
-	maxRetryDelayMs?: number; // default: 60000 (max server-requested delay before failing)
+	maxRetryDelayMs?: number; // default: 60000 (max server-requested retry delay before failing; 0 disables the cap)
+	/** Bounded wait-for-recovery loop for quota exhaustion and provider unavailability. */
+	waitForUsage?: ProviderWaitSettings;
 }
 
 export interface RetrySettings {
@@ -45,7 +56,7 @@ export interface TerminalSettings {
 	clearOnShrink?: boolean; // default: false (clear empty rows when content shrinks)
 	showTerminalProgress?: boolean; // default: false (OSC 9;4 terminal progress indicators)
 	fullscreen?: boolean; // default: true (alternate-screen rendering with scrollable transcript)
-	fullscreenMouse?: boolean; // default: true (wheel scrolling in fullscreen; disable if it breaks selection)
+	fullscreenMouse?: boolean; // default: true
 }
 
 export interface ImageSettings {
@@ -60,8 +71,48 @@ export interface ThinkingBudgetsSettings {
 	high?: number;
 }
 
+/** One autonomous-run budget limit: a positive number, or "unlimited" for no cap. */
+export type AutonomousLimitSetting = number | "unlimited";
+
+/**
+ * Persisted defaults for autonomous-run budget limits. They apply when a run
+ * starts without explicit `--autonomous-*` CLI or `/autonomous on` budget
+ * flags; explicit flags keep winning per run.
+ */
+export interface AutonomousSettings {
+	maxContinuations?: AutonomousLimitSetting;
+	maxTurns?: AutonomousLimitSetting;
+	maxTokens?: AutonomousLimitSetting;
+	timeoutMs?: AutonomousLimitSetting;
+}
+
+/** Autonomous limit settings resolved to finite positive numbers; invalid entries are dropped. */
+export interface ResolvedAutonomousLimits {
+	maxContinuations?: number;
+	maxTurns?: number;
+	maxTokens?: number;
+	timeoutMs?: number;
+}
+
+function resolveAutonomousLimit(value: AutonomousLimitSetting | undefined): number | undefined {
+	if (value === "unlimited") {
+		// Matches the runtime's UNLIMITED_AUTONOMOUS_LIMIT sentinel.
+		return Number.MAX_SAFE_INTEGER;
+	}
+	if (typeof value !== "number" || !Number.isFinite(value)) {
+		return undefined;
+	}
+	// Truncate before validating so a positive fraction (e.g. 0.5) drops to
+	// undefined instead of becoming a zero limit that stops the run immediately.
+	const truncated = Math.trunc(value);
+	return truncated > 0 ? truncated : undefined;
+}
+
+export type MermaidRenderingMode = "off" | "final" | "streaming";
+
 export interface MarkdownSettings {
 	codeBlockIndent?: string; // default: "  "
+	mermaid?: MermaidRenderingMode; // default: "streaming"
 }
 
 export interface BundledSkillsSettings {
@@ -90,10 +141,10 @@ export type PackageSource =
 	  };
 
 /**
- * Remote/local MCP server an integration connects to. Built-in integrations
- * (Linear/Notion) are defined in the ai/mcp catalog; this is for user-declared
- * servers. The kernel-side integration package reads creds from auth.json
- * (`mcp:<name>`); login/refresh run host-side.
+ * Remote/local MCP server an integration connects to. Catalog services are
+ * defined in the ai/mcp service catalog; this is for user-declared servers.
+ * The kernel's generic mcp runtime reads creds from auth.json (`mcp:<name>`);
+ * login/refresh/verification run host-side.
  */
 export type McpServerConfig =
 	| {
@@ -104,19 +155,37 @@ export type McpServerConfig =
 			bearerTokenEnvVar?: string;
 			/** Use the generic OAuth login flow for this server. */
 			oauth?: boolean;
+			/** Pre-registered OAuth client id for this server (optional). */
+			oauthClientId?: string;
+			/**
+			 * Env var holding the OAuth client secret. When set, a missing or
+			 * empty env value fails the login/refresh — never a stale stored
+			 * secret fallback.
+			 */
+			oauthClientSecretEnvVar?: string;
+			/** Client identity metadata document URL (CIMD) for this server. */
+			oauthClientMetadataUrl?: string;
+			/** Requested OAuth scopes for this server (config > PRM > omit). */
+			oauthScopes?: string[];
 			/** Force-disable even when credentials exist. */
 			enabled?: boolean;
 			enabledTools?: string[];
 			disabledTools?: string[];
+			startupTimeoutMs?: number;
+			callTimeoutMs?: number;
 	  }
 	| {
 			type: "stdio";
 			command: string;
 			args?: string[];
-			env?: Record<string, string>;
+			cwd?: string;
+			/** Environment variables resolved from the kernel environment. */
+			env?: Record<string, { env: string }>;
 			enabled?: boolean;
 			enabledTools?: string[];
 			disabledTools?: string[];
+			startupTimeoutMs?: number;
+			callTimeoutMs?: number;
 	  };
 
 export interface Settings {
@@ -124,10 +193,17 @@ export interface Settings {
 	onboardingCompleted?: boolean;
 	defaultProvider?: string;
 	defaultModel?: string;
+	subagentDefaultModel?: string; // "provider/id" for rlm.spawn without a pinned model; unset inherits the parent model
+	updateChannel?: "stable" | "nightly"; // release channel for self-updates; unset follows the running version
 	recentModels?: string[]; // "provider/id" keys, most-recently-used first
+	// "provider/id" for background LLM passes (refinement review and planning);
+	// unset falls back to the session model. Routing these to a different model
+	// keeps their different prompt prefixes from evicting the session's provider
+	// prefix-cache entry.
+	auxiliaryModel?: string;
 	defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	defaultServiceTier?: ServiceTier;
-	rlmMaxDepth?: number; // default for new sessions; unset falls through to RLM_MAX_DEPTH, then 1
+	rlmMaxDepth?: number; // default for new sessions; unset falls through to RLM_MAX_DEPTH, then 2
 	idleEvictionMinutes?: number | "off"; // global daemon policy; default: 90
 	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";
@@ -139,12 +215,19 @@ export interface Settings {
 	telemetry?: TelemetrySettings;
 	branchSummary?: BranchSummarySettings;
 	retry?: RetrySettings;
-	hideThinkingBlock?: boolean;
+	/**
+	 * User-defined backup model ("provider/model-id" or a bare model id) used
+	 * while the primary model is quota-blocked or its provider is unavailable.
+	 * Default: none - requests never silently switch models.
+	 */
+	providerBackupModel?: string;
+	autonomous?: AutonomousSettings;
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows)
 	quietStartup?: boolean;
 	shellCommandPrefix?: string; // Prefix prepended to every bash command (e.g., "shopt -s expand_aliases" for alias support)
 	npmCommand?: string[]; // Command used for npm package lookup/install operations, argv-style (e.g., ["mise", "exec", "node@20", "--", "npm"])
 	mcpServers?: Record<string, McpServerConfig>; // User-declared MCP servers (name → config); built-ins are in the ai/mcp catalog
+	mcpCatalogSources?: string[]; // Extra local MCP service catalog files (~-relative ok); merged after the built-in catalog, first source wins per id
 	packages?: PackageSource[]; // Array of npm/git package sources (string or object with filtering)
 	extensions?: string[]; // Array of local extension file paths or directories
 	skills?: string[]; // Array of local skill file paths or directories
@@ -186,8 +269,6 @@ function deepMergeSettings(base: Settings, overrides: Settings): Settings {
 		if (overrideValue === undefined) {
 			continue;
 		}
-
-		// For nested objects, merge recursively
 		if (
 			typeof overrideValue === "object" &&
 			overrideValue !== null &&
@@ -198,7 +279,6 @@ function deepMergeSettings(base: Settings, overrides: Settings): Settings {
 		) {
 			(result as Record<string, unknown>)[key] = { ...baseValue, ...overrideValue };
 		} else {
-			// For primitives and arrays, override value wins
 			(result as Record<string, unknown>)[key] = overrideValue;
 		}
 	}
@@ -230,11 +310,23 @@ export class FileSettingsStorage implements SettingsStorage {
 		const maxAttempts = 10;
 		const delayMs = 20;
 		let lastError: unknown;
+		let compromisedError: Error | undefined;
 
 		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 			try {
-				return lockfile.lockSync(path, { realpath: false });
+				const release = lockfile.lockSync(path, {
+					realpath: false,
+					onCompromised: (error) => {
+						compromisedError ??= error;
+					},
+				});
+				if (compromisedError) {
+					release();
+					throw compromisedError;
+				}
+				return release;
 			} catch (error) {
+				if (compromisedError) throw compromisedError;
 				const code =
 					typeof error === "object" && error !== null && "code" in error
 						? String((error as { code?: unknown }).code)
@@ -259,22 +351,26 @@ export class FileSettingsStorage implements SettingsStorage {
 
 		let release: (() => void) | undefined;
 		try {
-			// Only create directory and lock if file exists or we need to write
 			const fileExists = existsSync(path);
 			if (fileExists) {
 				release = this.acquireLockSyncWithRetry(path);
 			}
 			const current = fileExists ? readFileSync(path, "utf-8") : undefined;
-			const next = fn(current);
+			let next = fn(current);
 			if (next !== undefined) {
-				// Only create directory when we actually need to write
 				if (!existsSync(dir)) {
 					mkdirSync(dir, { recursive: true });
 				}
 				if (!release) {
 					release = this.acquireLockSyncWithRetry(path);
+					// The first-write read ran unlocked; a racing first writer may have landed since.
+					if (existsSync(path)) {
+						next = fn(readFileSync(path, "utf-8"));
+					}
 				}
-				writeFileSync(path, next, "utf-8");
+				if (next !== undefined) {
+					writeFileAtomicSync(path, next, { mode: 0o600 });
+				}
 			}
 		} finally {
 			if (release) {
@@ -396,19 +492,14 @@ export class SettingsManager {
 
 	/** Migrate old settings format to new format */
 	private static migrateSettings(settings: Record<string, unknown>): Settings {
-		// Migrate queueMode -> steeringMode
 		if ("queueMode" in settings && !("steeringMode" in settings)) {
 			settings.steeringMode = settings.queueMode;
 			delete settings.queueMode;
 		}
-
-		// Migrate legacy websockets boolean -> transport enum
 		if (!("transport" in settings) && typeof settings.websockets === "boolean") {
 			settings.transport = settings.websockets ? "websocket" : "sse";
 			delete settings.websockets;
 		}
-
-		// Migrate old skills object format to new array format
 		if (
 			"skills" in settings &&
 			typeof settings.skills === "object" &&
@@ -428,8 +519,6 @@ export class SettingsManager {
 				delete settings.skills;
 			}
 		}
-
-		// Migrate retry.maxDelayMs -> retry.provider.maxRetryDelayMs
 		if (
 			"retry" in settings &&
 			typeof settings.retry === "object" &&
@@ -460,6 +549,13 @@ export class SettingsManager {
 			(typeof settings.telemetry !== "object" || settings.telemetry === null || Array.isArray(settings.telemetry))
 		) {
 			delete settings.telemetry;
+		}
+
+		if (
+			settings.markdown !== undefined &&
+			(typeof settings.markdown !== "object" || settings.markdown === null || Array.isArray(settings.markdown))
+		) {
+			delete settings.markdown;
 		}
 
 		return settings as Settings;
@@ -686,6 +782,15 @@ export class SettingsManager {
 		return this.settings.defaultModel;
 	}
 
+	/** Model selector applied when `rlm.spawn` does not pin a model; unset inherits the parent model. */
+	getSubagentDefaultModel(): string | undefined {
+		// Parsed settings are only cast to Settings; a non-string JSON value
+		// (e.g. 42) must behave as unset, never throw into the spawn path.
+		const reference = this.settings.subagentDefaultModel;
+		if (typeof reference !== "string") return undefined;
+		return reference.trim() ? reference.trim() : undefined;
+	}
+
 	setDefaultProvider(provider: string): void {
 		this.globalSettings.defaultProvider = provider;
 		this.markModified("defaultProvider");
@@ -706,6 +811,13 @@ export class SettingsManager {
 		this.recordModelUseInternal(provider, modelId);
 		this.markModified("recentModels");
 		this.save();
+	}
+
+	getAuxiliaryModel(): string | undefined {
+		// Hand-edited or corrupt settings files can persist non-string values; treat
+		// anything malformed as unset so refinement falls back to the session model.
+		const value = this.settings.auxiliaryModel;
+		return typeof value === "string" ? value : undefined;
 	}
 
 	getRecentModels(): string[] {
@@ -745,6 +857,18 @@ export class SettingsManager {
 	setTheme(theme: string): void {
 		this.globalSettings.theme = theme;
 		this.markModified("theme");
+		this.save();
+	}
+
+	/** A per-user preference: read from global settings only, and ignore anything but the two known values. */
+	getUpdateChannel(): "stable" | "nightly" | undefined {
+		const channel = this.globalSettings.updateChannel;
+		return channel === "stable" || channel === "nightly" ? channel : undefined;
+	}
+
+	setUpdateChannel(channel: "stable" | "nightly"): void {
+		this.globalSettings.updateChannel = channel;
+		this.markModified("updateChannel");
 		this.save();
 	}
 
@@ -897,6 +1021,23 @@ export class SettingsManager {
 		};
 	}
 
+	/**
+	 * Persisted autonomous-run limit defaults, ready for the runtime. Invalid
+	 * entries are dropped so the built-in per-field defaults still apply.
+	 */
+	getAutonomousLimits(): ResolvedAutonomousLimits {
+		const settings = this.settings.autonomous;
+		if (!settings) {
+			return {};
+		}
+		return {
+			maxContinuations: resolveAutonomousLimit(settings.maxContinuations),
+			maxTurns: resolveAutonomousLimit(settings.maxTurns),
+			maxTokens: resolveAutonomousLimit(settings.maxTokens),
+			timeoutMs: resolveAutonomousLimit(settings.timeoutMs),
+		};
+	}
+
 	getBranchSummarySettings(): { reserveTokens: number; skipPrompt: boolean } {
 		return {
 			reserveTokens: this.settings.branchSummary?.reserveTokens ?? 16384,
@@ -929,22 +1070,32 @@ export class SettingsManager {
 		};
 	}
 
-	getProviderRetrySettings(): { timeoutMs?: number; maxRetries?: number; maxRetryDelayMs: number } {
+	getProviderRetrySettings(): { timeoutMs?: number; maxRetryDelayMs: number } {
 		return {
 			timeoutMs: this.settings.retry?.provider?.timeoutMs,
-			maxRetries: this.settings.retry?.provider?.maxRetries,
 			maxRetryDelayMs: this.settings.retry?.provider?.maxRetryDelayMs ?? 60000,
 		};
 	}
 
-	getHideThinkingBlock(): boolean {
-		return this.settings.hideThinkingBlock ?? false;
+	getProviderWaitSettings(): ProviderWaitPolicy {
+		const wait = this.settings.retry?.provider?.waitForUsage;
+		const bound = (value: number | undefined, fallback: number): number =>
+			typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : fallback;
+		return {
+			enabled: wait?.enabled ?? true,
+			baseDelayMs: bound(wait?.baseDelayMs, 1000),
+			maxDelayMs: bound(wait?.maxDelayMs, 300_000),
+			maxAttempts: bound(wait?.maxAttempts, 30),
+			maxWaitMs: bound(wait?.maxWaitMs, 900_000),
+		};
 	}
 
-	setHideThinkingBlock(hide: boolean): void {
-		this.globalSettings.hideThinkingBlock = hide;
-		this.markModified("hideThinkingBlock");
-		this.save();
+	getProviderBackupModel(): string | undefined {
+		// Parsed settings are only cast to Settings; a non-string JSON value
+		// (e.g. 123) must behave as unset, never throw into the retry path.
+		const reference = this.settings.providerBackupModel;
+		if (typeof reference !== "string") return undefined;
+		return reference.trim() ? reference.trim() : undefined;
 	}
 
 	getShellPath(): string | undefined {
@@ -1120,7 +1271,6 @@ export class SettingsManager {
 	}
 
 	getClearOnShrink(): boolean {
-		// Settings takes precedence, then env var, then default false
 		if (this.settings.terminal?.clearOnShrink !== undefined) {
 			return this.settings.terminal.clearOnShrink;
 		}
@@ -1137,7 +1287,6 @@ export class SettingsManager {
 	}
 
 	getFullscreen(): boolean {
-		// Env var overrides the setting (both directions) for one-off runs
 		if (process.env.PI_FULLSCREEN !== undefined) {
 			return process.env.PI_FULLSCREEN === "1";
 		}
@@ -1209,8 +1358,33 @@ export class SettingsManager {
 		return this.settings.enabledModels;
 	}
 
-	getMcpServers(): Record<string, McpServerConfig> | undefined {
-		return this.settings.mcpServers;
+	/** MCP execution is intentionally restricted to user/global settings. */
+	getGlobalMcpServers(): Record<string, McpServerConfig> | undefined {
+		return structuredClone(this.globalSettings.mcpServers);
+	}
+
+	/** Declared local service-catalog source paths (unexpanded ~ allowed). */
+	getMcpCatalogSources(): string[] {
+		return structuredClone(this.globalSettings.mcpCatalogSources ?? []);
+	}
+
+	setGlobalMcpServer(name: string, config: McpServerConfig, force = false): void {
+		if (this.globalSettings.mcpServers?.[name] && !force) {
+			throw new Error(`MCP server "${name}" already exists. Use --force to replace it.`);
+		}
+		this.globalSettings.mcpServers = { ...(this.globalSettings.mcpServers ?? {}), [name]: structuredClone(config) };
+		this.markModified("mcpServers", name);
+		this.save();
+	}
+
+	removeGlobalMcpServer(name: string): boolean {
+		if (!this.globalSettings.mcpServers?.[name]) return false;
+		const servers = { ...this.globalSettings.mcpServers };
+		delete servers[name];
+		this.globalSettings.mcpServers = servers;
+		this.markModified("mcpServers", name);
+		this.save();
+		return true;
 	}
 
 	setEnabledModels(patterns: string[] | undefined): void {
@@ -1263,6 +1437,18 @@ export class SettingsManager {
 
 	getCodeBlockIndent(): string {
 		return this.settings.markdown?.codeBlockIndent ?? "  ";
+	}
+
+	getMermaidRenderingMode(): MermaidRenderingMode {
+		const mode = this.settings.markdown?.mermaid;
+		return mode === "off" || mode === "final" ? mode : "streaming";
+	}
+
+	setMermaidRenderingMode(mode: MermaidRenderingMode): void {
+		this.globalSettings.markdown ??= {};
+		this.globalSettings.markdown.mermaid = mode;
+		this.markModified("markdown", "mermaid");
+		this.save();
 	}
 
 	getWarnings(): WarningSettings {

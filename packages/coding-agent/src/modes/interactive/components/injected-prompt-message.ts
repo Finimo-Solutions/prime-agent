@@ -1,5 +1,6 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
+	Clickable,
 	Container,
 	Markdown,
 	type MarkdownTheme,
@@ -10,6 +11,8 @@ import {
 } from "@earendil-works/pi-tui";
 import { GOAL_CONTEXT_CUSTOM_TYPE, type GoalContextDetails } from "../../../core/goals.js";
 import {
+	ASYNC_BASH_COMPLETION_CUSTOM_TYPE,
+	type AsyncBashCompletionDetails,
 	type CustomMessage,
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	type HeartbeatPromptDetails,
@@ -22,8 +25,10 @@ import {
 } from "../../../core/messages.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 import { expandCollapseHint } from "./keybinding-hints.js";
+import { ShellCompletionComponent } from "./shell-completion.js";
 
 type InjectedPromptDetails =
+	| AsyncBashCompletionDetails
 	| GoalContextDetails
 	| HeartbeatPromptDetails
 	| IpythonStateRestoredDetails
@@ -34,7 +39,8 @@ type InjectedPromptMessage = CustomMessage<InjectedPromptDetails>;
 export function isInjectedPromptMessage(message: AgentMessage): message is InjectedPromptMessage {
 	return (
 		message.role === "custom" &&
-		(message.customType === HEARTBEAT_PROMPT_CUSTOM_TYPE ||
+		(message.customType === ASYNC_BASH_COMPLETION_CUSTOM_TYPE ||
+			message.customType === HEARTBEAT_PROMPT_CUSTOM_TYPE ||
 			message.customType === GOAL_CONTEXT_CUSTOM_TYPE ||
 			message.customType === IPYTHON_STATE_RESTORED_CUSTOM_TYPE ||
 			message.customType === RLM_CHILD_FAILURE_CUSTOM_TYPE ||
@@ -89,7 +95,7 @@ export class InjectedPromptMessageComponent extends Container {
 		private readonly markdownTheme: MarkdownTheme = getMarkdownTheme(),
 	) {
 		super();
-		this.addChild(new Spacer(1));
+		if (this.message.customType !== ASYNC_BASH_COMPLETION_CUSTOM_TYPE) this.addChild(new Spacer(1));
 		this.addChild(this.content);
 		this.updateDisplay();
 	}
@@ -109,8 +115,14 @@ export class InjectedPromptMessageComponent extends Container {
 
 	private updateDisplay(): void {
 		this.content.clear();
+		if (this.message.customType === ASYNC_BASH_COMPLETION_CUSTOM_TYPE) {
+			const shell = new ShellCompletionComponent(this.message);
+			shell.setExpanded(this.expanded);
+			this.content.addChild(shell);
+			return;
+		}
 		this.header.setText(this.headerText());
-		this.content.addChild(this.header);
+		this.content.addChild(new Clickable(this.header, () => this.setExpanded(!this.expanded)));
 		if (this.expanded && this.message.customType !== IPYTHON_STATE_RESTORED_CUSTOM_TYPE) {
 			this.content.addChild(
 				new Markdown(readCustomText(this.message), 1, 0, this.markdownTheme, {
@@ -127,7 +139,7 @@ export class InjectedPromptMessageComponent extends Container {
 		}
 		if (this.message.customType === IPYTHON_STATE_RESTORED_CUSTOM_TYPE) {
 			const details = this.message.details as IpythonStateRestoredDetails | undefined;
-			const label = details?.restored === false ? "Started fresh IPython kernel" : "Restored IPython kernel state";
+			const label = details?.restored === false ? "Started fresh Python kernel" : "Restored Python kernel state";
 			return `${theme.fg("accent", "◆")} ${theme.fg("muted", label)}`;
 		}
 		if (

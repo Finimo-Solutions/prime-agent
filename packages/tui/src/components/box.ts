@@ -1,3 +1,4 @@
+import type { ClickRegion } from "../click-regions.js";
 import type { TableCellSelectionRegion } from "../selection-metadata.js";
 import type { Component } from "../tui.js";
 import { applyBackgroundToLine, visibleWidth } from "../utils.js";
@@ -10,6 +11,10 @@ type RenderCache = {
 	selectionRegions: TableCellSelectionRegion[];
 };
 
+type ClickCache = {
+	clickRegions: ClickRegion[];
+};
+
 /**
  * Box component - a container that applies padding and background to all children
  */
@@ -19,8 +24,8 @@ export class Box implements Component {
 	private paddingY: number;
 	private bgFn?: (text: string) => string;
 
-	// Cache for rendered output
 	private cache?: RenderCache;
+	private clickCache?: ClickCache;
 
 	constructor(paddingX = 1, paddingY = 1, bgFn?: (text: string) => string) {
 		this.paddingX = paddingX;
@@ -53,6 +58,7 @@ export class Box implements Component {
 
 	private invalidateCache(): void {
 		this.cache = undefined;
+		this.clickCache = undefined;
 	}
 
 	private matchCache(width: number, childLines: string[], bgSample: string | undefined): boolean {
@@ -76,15 +82,16 @@ export class Box implements Component {
 	render(width: number): string[] {
 		if (this.children.length === 0) {
 			this.cache = undefined;
+			this.clickCache = { clickRegions: [] };
 			return [];
 		}
 
 		const contentWidth = Math.max(1, width - this.paddingX * 2);
 		const leftPad = " ".repeat(this.paddingX);
 
-		// Render all children
 		const childLines: string[] = [];
 		const selectionRegions: TableCellSelectionRegion[] = [];
+		const clickRegions: ClickRegion[] = [];
 		for (const child of this.children) {
 			const lineOffset = childLines.length;
 			const lines = child.render(contentWidth);
@@ -99,6 +106,13 @@ export class Box implements Component {
 					tableRight: region.tableRight + this.paddingX,
 				});
 			}
+			for (const region of child.getClickRegions?.() ?? []) {
+				clickRegions.push({
+					...region,
+					line: region.line + lineOffset + this.paddingY,
+					col: region.col + this.paddingX,
+				});
+			}
 			for (const line of lines) {
 				childLines.push(leftPad + line);
 			}
@@ -106,37 +120,32 @@ export class Box implements Component {
 
 		if (childLines.length === 0) {
 			this.cache = undefined;
+			this.clickCache = { clickRegions: [] };
 			return [];
 		}
+		this.clickCache = { clickRegions };
 
-		// Check if bgFn output changed by sampling
 		const bgSample = this.bgFn ? this.bgFn("test") : undefined;
 
-		// Check cache validity
 		if (this.matchCache(width, childLines, bgSample)) {
 			this.cache!.selectionRegions = selectionRegions;
 			return this.cache!.lines;
 		}
 
-		// Apply background and padding
 		const result: string[] = [];
 
-		// Top padding
 		for (let i = 0; i < this.paddingY; i++) {
 			result.push(this.applyBg("", width));
 		}
 
-		// Content
 		for (const line of childLines) {
 			result.push(this.applyBg(line, width));
 		}
 
-		// Bottom padding
 		for (let i = 0; i < this.paddingY; i++) {
 			result.push(this.applyBg("", width));
 		}
 
-		// Update cache
 		this.cache = { childLines, width, bgSample, lines: result, selectionRegions };
 
 		return result;
@@ -144,6 +153,10 @@ export class Box implements Component {
 
 	getSelectionRegions(): ReadonlyArray<TableCellSelectionRegion> {
 		return this.cache?.selectionRegions ?? [];
+	}
+
+	getClickRegions(): ReadonlyArray<ClickRegion> {
+		return this.clickCache?.clickRegions ?? [];
 	}
 
 	private applyBg(line: string, width: number): string {
