@@ -23,7 +23,19 @@ import {
 	type GoalConditionResult,
 } from "./goals.js";
 
-const MAX_CAPTURED_OUTPUT_CHARS = 2000;
+/**
+ * Per-condition output cap: a noisy check must not flood stored goal state.
+ *
+ * The captured output is load-bearing, not decoration. `formatGoalConditionRefusal`
+ * builds the refusal from it, and that refusal is the ONLY channel through which
+ * the agent learns WHAT to fix. Degraded to the bare command, the gate still
+ * blocks but stops teaching, and the agent loops on a reason it was never told —
+ * the same vacuity this module exists to forbid, one level up.
+ *
+ * Its test asserts a LITERAL 2000, never this constant: an assertion that moves
+ * with the value it guards can never fail.
+ */
+export const MAX_CAPTURED_OUTPUT_CHARS = 2000;
 
 export interface EvaluateGoalConditionsOptions {
 	cwd: string;

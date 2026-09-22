@@ -54,6 +54,31 @@ describe("goal definition-of-done conditions", () => {
 		await expect(harness.session.handleGoalHostRequest("goal.complete")).rejects.toThrow(/D2.*test -f missing\.txt/s);
 	});
 
+	it("carries the failing condition's own output into the refusal", async () => {
+		const harness = await goalHarness();
+		await harness.session.handleGoalHostRequest("goal.create", {
+			objective: "a condition that explains itself",
+			conditions: ["echo 'ENOENT: config.yaml is missing' >&2; exit 1"],
+		});
+
+		await expect(harness.session.handleGoalHostRequest("goal.complete")).rejects.toThrow(
+			/ENOENT: config\.yaml is missing/,
+		);
+	});
+
+	it("bounds captured output so one noisy condition cannot flood the goal", async () => {
+		const results = await evaluateGoalConditions(
+			[{ id: "D1", command: "head -c 60000 /dev/zero | tr '\\0' 'x'; exit 1", baselineExit: 1 }],
+			{ cwd: tmpdir() },
+		);
+
+		expect(results[0].passed).toBe(false);
+		expect(results[0].output).toBeDefined();
+		// Literal bound: asserting against the constant would move with it.
+		expect((results[0].output ?? "").length).toBeLessThanOrEqual(2000);
+		expect(results[0].output).toBe("x".repeat(2000));
+	});
+
 	it("completes once the work actually satisfies the condition", async () => {
 		const harness = await goalHarness();
 		await harness.session.handleGoalHostRequest("goal.create", {
@@ -83,9 +108,6 @@ describe("goal definition-of-done conditions", () => {
 	});
 
 	it("allows a regression guard alongside a discriminating condition, and names it", async () => {
-		// "the suite still passes" is green at baseline BY DESIGN. Blocking
-		// non-discriminating conditions outright would forbid regression guards,
-		// so one is allowed — it is reported, not refused.
 		const harness = await goalHarness();
 		writeFileSync(join(harness.tempDir, "already-there.txt"), "");
 		await harness.session.handleGoalHostRequest("goal.create", {
@@ -132,8 +154,8 @@ describe("goal definition-of-done conditions", () => {
 			{ cwd: tmpdir(), timeoutMs: 5_000, totalTimeoutMs: 120 },
 		);
 
-		expect(results[0]).toMatchObject({ passed: false });
 		// D2 would pass if run; an unrun check is not a pass.
+		expect(results[0]).toMatchObject({ passed: false });
 		expect(results[1]).toMatchObject({ passed: false, exitCode: 124 });
 		expect(results[1].output).toContain("budget");
 	});
@@ -149,22 +171,11 @@ describe("goal definition-of-done conditions", () => {
 		expect(harness.session.goalState.status).toBe("active");
 	});
 
-	it("reports a condition as red when the command cannot run in its directory", async () => {
-		// An unknown binary still spawns `sh` (which exits 127); an unusable
-		// working directory is the other failure shape. Both must stay red —
-		// a check that cannot run is not a pass.
-		const results = await evaluateGoalConditions([{ id: "D1", command: "true", baselineExit: 1 }], {
-			cwd: join(tmpdir(), "goal-conditions-directory-that-does-not-exist"),
-		});
-
-		expect(results[0]).toMatchObject({ passed: false });
-	});
-
-	it("fails a condition that hangs instead of waiting on it forever", async () => {
-		const results = await evaluateGoalConditions([{ id: "D1", command: "sleep 30", baselineExit: 1 }], {
-			cwd: tmpdir(),
-			timeoutMs: 150,
-		});
+	it.each([
+		{ name: "an unusable working directory", command: "true", cwd: join(tmpdir(), "no-such-dir"), timeoutMs: 5_000 },
+		{ name: "a command that hangs", command: "sleep 30", cwd: tmpdir(), timeoutMs: 150 },
+	])("reports a condition red when it cannot run: $name", async ({ command, cwd, timeoutMs }) => {
+		const results = await evaluateGoalConditions([{ id: "D1", command, baselineExit: 1 }], { cwd, timeoutMs });
 
 		expect(results[0]).toMatchObject({ passed: false });
 	});
@@ -172,7 +183,6 @@ describe("goal definition-of-done conditions", () => {
 	it("leaves goals without conditions completing exactly as before", async () => {
 		const harness = await goalHarness();
 		await harness.session.handleGoalHostRequest("goal.create", { objective: "no conditions supplied" });
-
 		const completed = await harness.session.handleGoalHostRequest("goal.complete");
 
 		expect(completed.goal).toMatchObject({ status: "complete" });
