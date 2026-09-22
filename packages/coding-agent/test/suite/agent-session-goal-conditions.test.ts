@@ -39,7 +39,6 @@ describe("goal definition-of-done conditions", () => {
 		await expect(harness.session.handleGoalHostRequest("goal.complete")).rejects.toThrow(
 			/cannot complete goal: 1 of 1 conditions are not satisfied/,
 		);
-		// The refusal must leave the goal running, or the agent escapes anyway.
 		expect(harness.session.goalState).toMatchObject({ status: "active", active: true });
 	});
 
@@ -58,12 +57,10 @@ describe("goal definition-of-done conditions", () => {
 		const harness = await goalHarness();
 		await harness.session.handleGoalHostRequest("goal.create", {
 			objective: "a condition that explains itself",
-			conditions: ["echo 'ENOENT: config.yaml is missing' >&2; exit 1"],
+			conditions: ["ls /zzz-no-such-path"],
 		});
 
-		await expect(harness.session.handleGoalHostRequest("goal.complete")).rejects.toThrow(
-			/ENOENT: config\.yaml is missing/,
-		);
+		await expect(harness.session.handleGoalHostRequest("goal.complete")).rejects.toThrow(/No such file or directory/);
 	});
 
 	it("bounds captured output so one noisy condition cannot flood the goal", async () => {
@@ -74,7 +71,6 @@ describe("goal definition-of-done conditions", () => {
 
 		expect(results[0].passed).toBe(false);
 		expect(results[0].output).toBeDefined();
-		// Literal bound: asserting against the constant would move with it.
 		expect((results[0].output ?? "").length).toBeLessThanOrEqual(2000);
 		expect(results[0].output).toBe("x".repeat(2000));
 	});
@@ -129,11 +125,9 @@ describe("goal definition-of-done conditions", () => {
 			conditions: ["test -f unreachable.txt"],
 		});
 
-		// A waiver without a reason is not a waiver.
 		await expect(harness.session.handleGoalHostRequest("goal.complete", { waive: { D1: "  " } })).rejects.toThrow(
 			/requires a non-empty reason/,
 		);
-		// Still blocked without one.
 		await expect(harness.session.handleGoalHostRequest("goal.complete")).rejects.toThrow(/not satisfied/);
 
 		await harness.session.handleGoalHostRequest("goal.complete", {
@@ -145,6 +139,13 @@ describe("goal definition-of-done conditions", () => {
 		expect(harness.session.goalState.lastReason).toContain("staging DNS is down");
 	});
 
+	it("refuses a waiver on a goal that has no conditions to waive", async () => {
+		const h = await goalHarness();
+		await h.session.handleGoalHostRequest("goal.create", { objective: "no conditions" });
+		const done = h.session.handleGoalHostRequest("goal.complete", { waive: { D1: "nothing" } });
+		await expect(done).rejects.toThrow(/goal has none/);
+	});
+
 	it("reports conditions left unrun by the total budget as red, never as passed", async () => {
 		const results = await evaluateGoalConditions(
 			[
@@ -154,7 +155,6 @@ describe("goal definition-of-done conditions", () => {
 			{ cwd: tmpdir(), timeoutMs: 5_000, totalTimeoutMs: 120 },
 		);
 
-		// D2 would pass if run; an unrun check is not a pass.
 		expect(results[0]).toMatchObject({ passed: false });
 		expect(results[1]).toMatchObject({ passed: false, exitCode: 124 });
 		expect(results[1].output).toContain("budget");

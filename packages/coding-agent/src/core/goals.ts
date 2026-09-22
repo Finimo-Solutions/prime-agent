@@ -175,7 +175,14 @@ export function validateGoalConditions(value: unknown): GoalConditionInput[] | u
 }
 
 /**
- * The refusal text shown to the model when completion is blocked. Waived
+ * The refusal text shown to the model when completion is blocked.
+ *
+ * NOTE for anyone testing this: the refusal prints `result.command` on every
+ * line, so a fixture whose COMMAND contains the asserted text (`echo 'boom'`)
+ * matches itself and can never fail. Assert on text that can only come from
+ * the condition's output, e.g. `ls /zzz-no-such-path` -> "No such file".
+ *
+ * Waived
  * conditions are listed too: a reader must be able to see that a red check was
  * excused rather than passed.
  */
