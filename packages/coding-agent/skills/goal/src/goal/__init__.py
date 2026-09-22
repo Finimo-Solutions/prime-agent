@@ -22,7 +22,11 @@ async def get() -> dict[str, Any]:
     return await host_request("goal.get")
 
 
-async def create(objective: str, token_budget: int | None = None) -> dict[str, Any]:
+async def create(
+    objective: str,
+    token_budget: int | None = None,
+    conditions: list[str] | None = None,
+) -> dict[str, Any]:
     """Start a new active thread goal.
 
     Fails while a goal is still pending (active, paused, or budget-limited);
@@ -30,14 +34,25 @@ async def create(objective: str, token_budget: int | None = None) -> dict[str, A
     or system/developer instructions explicitly ask for a persistent
     long-running goal. Set `token_budget` only when an explicit token budget is
     requested.
+
+    `conditions` is the goal's Definition of Done: shell commands, numbered
+    D1..Dn, each satisfied when it exits 0. `complete()` is REFUSED while any
+    of them fails, so the objective stops being a claim only you can check.
+    Each condition is run once at creation to record whether it was already
+    green — one that was cannot discriminate, and is reported as proving
+    nothing when the goal completes.
     """
     if not isinstance(objective, str):
         raise TypeError(f"objective must be str, got {type(objective).__name__}")
     if token_budget is not None and not isinstance(token_budget, int):
         raise TypeError(f"token_budget must be int or None, got {type(token_budget).__name__}")
+    if conditions is not None and not isinstance(conditions, list):
+        raise TypeError(f"conditions must be list[str] or None, got {type(conditions).__name__}")
     payload: dict[str, Any] = {"objective": objective}
     if token_budget is not None:
         payload["token_budget"] = token_budget
+    if conditions is not None:
+        payload["conditions"] = conditions
     return await host_request("goal.create", payload)
 
 
@@ -48,5 +63,8 @@ async def complete() -> dict[str, Any]:
     work remains — not because the budget is nearly exhausted or because you
     are stopping work. Pause, resume, and budget-limit transitions are
     controlled by the user and the host.
+
+    When the goal carries conditions, the host runs them now and RAISES with
+    the failing ones listed rather than completing; the goal stays active.
     """
     return await host_request("goal.complete")

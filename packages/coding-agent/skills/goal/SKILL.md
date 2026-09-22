@@ -15,6 +15,8 @@ await goal.get()
 await goal.create("ship the release notes")
 # Only pass token_budget when the user explicitly asks for one:
 # await goal.create("ship the release notes", token_budget=200000)
+# A Definition of Done — completion is refused while any of these fails:
+await goal.create("make the suite green", conditions=["npm test", "npm run lint"])
 await goal.complete()
 ```
 
@@ -24,17 +26,20 @@ await goal.complete()
   is set), `remaining_tokens`, and `completion_budget_report`. The `goal` dict
   carries `objective`, `status`, `token_budget`, `tokens_used`,
   `time_used_seconds`, and timestamps.
-- `await goal.create(objective, token_budget=None)` — start a new active goal.
-  Fails while a goal is still pending (active, paused, or budget-limited); a
-  completed or errored goal is replaced by the new one. Only create a goal when
-  the user or system/developer instructions explicitly ask for a persistent
-  long-running goal; do not infer goals from ordinary tasks. Set `token_budget`
-  only when an explicit token budget is requested.
+- `await goal.create(objective, token_budget=None, conditions=None)` — start a
+  new active goal. Fails while a goal is still pending (active, paused, or
+  budget-limited); a completed or errored goal is replaced by the new one. Only
+  create a goal when the user or system/developer instructions explicitly ask
+  for a persistent long-running goal; do not infer goals from ordinary tasks.
+  Set `token_budget` only when an explicit token budget is requested.
+  `conditions` is a list of shell commands, numbered `D1..Dn`, each satisfied
+  when it exits 0 — the goal's machine-readable Definition of Done.
 - `await goal.complete()` — mark the existing goal achieved. Use only when the
   objective has actually been achieved and no required work remains; do not
   call it merely because the budget is nearly exhausted or because you are
-  stopping work. When the result includes a `completion_budget_report`, report
-  that final usage to the user.
+  stopping work. When the goal carries conditions, the host runs them and
+  RAISES with the failing ones listed instead of completing. When the result
+  includes a `completion_budget_report`, report that final usage to the user.
 
 ## Rules
 
@@ -44,3 +49,8 @@ await goal.complete()
 - When an active goal is actually complete, call `await goal.complete()`; do
   not merely say it is done — the harness keeps continuing the goal until the
   completion call arrives.
+- Prefer conditions the user can check over prose only you can. A condition
+  must be able to FAIL: one that already passes before you start proves
+  nothing, and is reported as non-discriminating when the goal completes.
+- A refused completion is not an error to work around. Do the work the failing
+  condition describes, then call `await goal.complete()` again.
