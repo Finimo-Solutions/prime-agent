@@ -10,17 +10,31 @@ export const MAX_GOAL_CONDITIONS = 20;
 export const MAX_GOAL_CONDITION_CHARS = 2000;
 /** Per-condition wall-clock ceiling. A condition that hangs is a failed condition. */
 export const GOAL_CONDITION_TIMEOUT_MS = 120_000;
-
 /**
- * One machine-readable Definition-of-Done condition. `command` runs under
- * `sh -c`; exit 0 means satisfied. `baselineExit` is the exit code recorded
- * when the goal was created: a condition that already passed then cannot
- * discriminate, so it proves nothing about the work that followed.
+ * Ceiling for evaluating a whole Definition of Done. Without it the worst case
+ * is MAX_GOAL_CONDITIONS x GOAL_CONDITION_TIMEOUT_MS (40 minutes) on both the
+ * creation and the completion path. Conditions not reached inside the budget
+ * are reported red, never skipped.
  */
-export interface GoalCondition {
+export const GOAL_CONDITIONS_TOTAL_TIMEOUT_MS = 600_000;
+
+/** A Definition-of-Done condition as supplied, before it has been baselined. */
+export interface GoalConditionInput {
 	id: string;
 	command: string;
-	baselineExit?: number;
+}
+
+/**
+ * A stored condition. `command` runs under `sh -c`; exit 0 means satisfied.
+ *
+ * `baselineExit` is REQUIRED, not optional: it is the exit code recorded before
+ * any work started, and the vacuity check reads it. An optional field here
+ * degrades silently — every condition would read as discriminating whenever the
+ * baseline was missing, reporting a clean pass for a check that proved nothing.
+ * Requiring it makes an unbaselined stored condition unrepresentable.
+ */
+export interface GoalCondition extends GoalConditionInput {
+	baselineExit: number;
 }
 
 export interface GoalConditionResult {
@@ -132,7 +146,7 @@ export function validateGoalBudget(value: number | undefined): number | undefine
  * work-order convention. Returns undefined when no conditions are supplied —
  * conditions are optional, so existing goals keep working unchanged.
  */
-export function validateGoalConditions(value: unknown): GoalCondition[] | undefined {
+export function validateGoalConditions(value: unknown): GoalConditionInput[] | undefined {
 	if (value === undefined || value === null) {
 		return undefined;
 	}
@@ -160,9 +174,13 @@ export function validateGoalConditions(value: unknown): GoalCondition[] | undefi
 	});
 }
 
-/** The refusal text shown to the model when completion is blocked. */
-export function formatGoalConditionRefusal(results: GoalConditionResult[]): string {
-	const failed = results.filter((result) => !result.passed);
+/**
+ * The refusal text shown to the model when completion is blocked. Waived
+ * conditions are listed too: a reader must be able to see that a red check was
+ * excused rather than passed.
+ */
+export function formatGoalConditionRefusal(results: GoalConditionResult[], waivers?: Map<string, string>): string {
+	const failed = results.filter((result) => !result.passed && !waivers?.has(result.id));
 	const lines = failed.map((result) => {
 		const detail = result.output?.trim();
 		const suffix = detail ? ` — ${detail.split("\n").slice(-1)[0]?.slice(0, 200)}` : "";
@@ -172,6 +190,74 @@ export function formatGoalConditionRefusal(results: GoalConditionResult[]): stri
 		`cannot complete goal: ${failed.length} of ${results.length} conditions are not satisfied.`,
 		...lines,
 		"The goal stays active. Do the work these conditions describe, then call `await goal.complete()` again.",
+		"If a condition is red for a reason the work cannot fix, waive it WITH A REASON:",
+		'`await goal.complete(waive={"D2": "staging DNS is down, verified by hand"})` — the waiver is recorded on the goal.',
+	].join("\n");
+}
+
+/**
+ * What the completed goal records. Waivers and non-discriminating conditions
+ * are both named, because a completion that hides either is a completion a
+ * reader cannot audit.
+ */
+export function formatGoalCompletionReason(results: GoalConditionResult[], waivers?: Map<string, string>): string {
+	const parts = [`${results.length} conditions evaluated`];
+	const waived = results.filter((result) => !result.passed && waivers?.has(result.id));
+	if (waived.length) {
+		parts.push(`WAIVED ${waived.map((r) => `${r.id} (${waivers?.get(r.id)})`).join("; ")}`);
+	}
+	const vacuous = results.filter((result) => result.nonDiscriminating);
+	if (vacuous.length) {
+		parts.push(`${vacuous.map((r) => r.id).join(", ")} also passed before the work started and prove nothing`);
+	}
+	return `Goal achieved (${parts.join("; ")})`;
+}
+
+/**
+ * Waivers are `{conditionId: reason}`. A reason is mandatory: an exemption that
+ * leaves no trace is indistinguishable from a skipped gate, and the only other
+ * escape from a stuck condition is `/goal clear`, which destroys the goal and
+ * with it the evidence that a gate existed at all.
+ */
+export function validateGoalWaivers(value: unknown): Map<string, string> | undefined {
+	if (value === undefined || value === null) {
+		return undefined;
+	}
+	if (typeof value !== "object" || Array.isArray(value)) {
+		throw new Error('Goal waivers must be a mapping of condition id to reason, e.g. {"D2": "why"}.');
+	}
+	const entries = Object.entries(value as Record<string, unknown>);
+	if (!entries.length) {
+		return undefined;
+	}
+	return new Map(
+		entries.map(([id, reason]) => {
+			if (typeof reason !== "string" || !reason.trim()) {
+				throw new Error(`Waiving ${id} requires a non-empty reason explaining why the condition cannot be met.`);
+			}
+			return [id, reason.trim()];
+		}),
+	);
+}
+
+/**
+ * Refuse a Definition of Done that cannot fail. One condition green at
+ * baseline is legitimate — a regression guard ("the suite still passes") is
+ * non-discriminating by construction and is exactly the check you want. But if
+ * EVERY condition is already green before any work starts, the whole DoD is
+ * satisfied the moment it is written, and completion would be a formality.
+ * Caught at creation, while it is still cheap to state a real one.
+ */
+export function vacuousDefinitionOfDone(conditions: GoalCondition[]): string | null {
+	if (!conditions.every((condition) => condition.baselineExit === 0)) {
+		return null;
+	}
+	const listed = conditions.map((condition) => `  ${condition.id} ${condition.command}`);
+	return [
+		`cannot create goal: all ${conditions.length} conditions already pass before any work has started,`,
+		"so this Definition of Done cannot fail and completing it would prove nothing.",
+		...listed,
+		"Add at least one condition that is red now and will be green when the objective is met.",
 	].join("\n");
 }
 

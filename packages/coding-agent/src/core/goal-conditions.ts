@@ -11,18 +11,27 @@
  *   - a condition must be able to FAIL, so the baseline exit code is recorded
  *     at goal creation and a condition that was already green is reported as
  *     non-discriminating;
- *   - a condition that hangs is a failed condition, hence the hard timeout.
+ *   - a condition that hangs is a failed condition, hence the timeouts.
  */
 
 import { execCommand } from "./exec.js";
-import { GOAL_CONDITION_TIMEOUT_MS, type GoalCondition, type GoalConditionResult } from "./goals.js";
+import {
+	GOAL_CONDITION_TIMEOUT_MS,
+	GOAL_CONDITIONS_TOTAL_TIMEOUT_MS,
+	type GoalCondition,
+	type GoalConditionInput,
+	type GoalConditionResult,
+} from "./goals.js";
 
 const MAX_CAPTURED_OUTPUT_CHARS = 2000;
 
 export interface EvaluateGoalConditionsOptions {
 	cwd: string;
 	signal?: AbortSignal;
+	/** Per-condition ceiling. */
 	timeoutMs?: number;
+	/** Ceiling for the whole set. */
+	totalTimeoutMs?: number;
 }
 
 /**
@@ -34,41 +43,65 @@ export async function evaluateGoalConditions(
 	conditions: GoalCondition[],
 	options: EvaluateGoalConditionsOptions,
 ): Promise<GoalConditionResult[]> {
-	const timeout = options.timeoutMs ?? GOAL_CONDITION_TIMEOUT_MS;
-	const results: GoalConditionResult[] = [];
-	for (const condition of conditions) {
-		// Sequential on purpose: conditions routinely touch the same working
-		// tree (build, then test the build), so racing them would make the
-		// verdict depend on scheduling.
-		const exitCode = await runCondition(condition.command, options.cwd, timeout, options.signal);
-		results.push({
+	const outcomes = await runAll(conditions, options);
+	return conditions.map((condition, index) => {
+		const outcome = outcomes[index];
+		return {
 			id: condition.id,
 			command: condition.command,
-			passed: exitCode.code === 0,
-			exitCode: exitCode.code,
-			nonDiscriminating: exitCode.code === 0 && condition.baselineExit === 0,
-			output: exitCode.output,
-		});
-	}
-	return results;
+			passed: outcome.code === 0,
+			exitCode: outcome.code,
+			nonDiscriminating: outcome.code === 0 && condition.baselineExit === 0,
+			output: outcome.output,
+		};
+	});
 }
 
 /**
- * Record how each condition behaves BEFORE any work happens. A condition that
- * already exits 0 here can never discriminate, and saying so at creation time
- * is what stops a vacuous Definition of Done being written in the first place.
+ * Record how each condition behaves BEFORE any work happens, returning fully
+ * baselined conditions. A condition that already exits 0 here can never
+ * discriminate, and the caller refuses a set where that is true of all of them.
+ *
+ * Returning `GoalCondition[]` (whose `baselineExit` is required) is what stops
+ * a half-baselined condition ever reaching stored goal state.
  */
 export async function captureGoalConditionBaseline(
-	conditions: GoalCondition[],
+	conditions: GoalConditionInput[],
 	options: EvaluateGoalConditionsOptions,
 ): Promise<GoalCondition[]> {
-	const timeout = options.timeoutMs ?? GOAL_CONDITION_TIMEOUT_MS;
-	const baselined: GoalCondition[] = [];
+	const outcomes = await runAll(conditions, options);
+	return conditions.map((condition, index) => ({ ...condition, baselineExit: outcomes[index].code }));
+}
+
+/**
+ * Sequential on purpose: conditions routinely touch the same working tree
+ * (build, then test the build), so racing them would make a red verdict depend
+ * on scheduling — and a verdict that is not reproducible cannot serve as
+ * evidence. The total budget bounds the worst case; conditions past it are
+ * reported red rather than skipped, because an unrun check is not a pass.
+ */
+async function runAll(
+	conditions: readonly GoalConditionInput[],
+	options: EvaluateGoalConditionsOptions,
+): Promise<{ code: number; output?: string }[]> {
+	const perCondition = options.timeoutMs ?? GOAL_CONDITION_TIMEOUT_MS;
+	const total = options.totalTimeoutMs ?? GOAL_CONDITIONS_TOTAL_TIMEOUT_MS;
+	const deadline = Date.now() + total;
+	const outcomes: { code: number; output?: string }[] = [];
 	for (const condition of conditions) {
-		const outcome = await runCondition(condition.command, options.cwd, timeout, options.signal);
-		baselined.push({ ...condition, baselineExit: outcome.code });
+		const remaining = deadline - Date.now();
+		if (remaining <= 0) {
+			outcomes.push({
+				code: 124,
+				output: `not run: the ${Math.round(total / 1000)}s budget for the whole Definition of Done was exhausted`,
+			});
+			continue;
+		}
+		outcomes.push(
+			await runCondition(condition.command, options.cwd, Math.min(perCondition, remaining), options.signal),
+		);
 	}
-	return baselined;
+	return outcomes;
 }
 
 /**

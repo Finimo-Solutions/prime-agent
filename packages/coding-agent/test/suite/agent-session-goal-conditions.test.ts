@@ -66,21 +66,76 @@ describe("goal definition-of-done conditions", () => {
 		const completed = await harness.session.handleGoalHostRequest("goal.complete");
 
 		expect(completed.goal).toMatchObject({ status: "complete" });
-		expect(harness.session.goalState.lastReason).toContain("1 conditions passed");
+		expect(harness.session.goalState.lastReason).toContain("1 conditions evaluated");
 	});
 
-	it("reports a condition that was already green as proving nothing", async () => {
+	it("refuses a Definition of Done where every condition already passes", async () => {
+		const harness = await goalHarness();
+		writeFileSync(join(harness.tempDir, "already-there.txt"), "");
+
+		await expect(
+			harness.session.handleGoalHostRequest("goal.create", {
+				objective: "a goal whose checks cannot fail",
+				conditions: ["test -f already-there.txt", "true"],
+			}),
+		).rejects.toThrow(/all 2 conditions already pass before any work has started/);
+		expect(harness.session.goalState.status).toBe("idle");
+	});
+
+	it("allows a regression guard alongside a discriminating condition, and names it", async () => {
+		// "the suite still passes" is green at baseline BY DESIGN. Blocking
+		// non-discriminating conditions outright would forbid regression guards,
+		// so one is allowed — it is reported, not refused.
 		const harness = await goalHarness();
 		writeFileSync(join(harness.tempDir, "already-there.txt"), "");
 		await harness.session.handleGoalHostRequest("goal.create", {
-			objective: "a goal whose check cannot fail",
-			conditions: ["test -f already-there.txt"],
+			objective: "add the artefact without breaking what exists",
+			conditions: ["test -f already-there.txt", "test -f new.txt"],
 		});
+		writeFileSync(join(harness.tempDir, "new.txt"), "");
 
 		await harness.session.handleGoalHostRequest("goal.complete");
 
 		expect(harness.session.goalState.lastReason).toContain("D1");
 		expect(harness.session.goalState.lastReason).toContain("prove nothing");
+	});
+
+	it("waives a red condition only with a reason, and records it on the goal", async () => {
+		const harness = await goalHarness();
+		await harness.session.handleGoalHostRequest("goal.create", {
+			objective: "blocked by something the work cannot fix",
+			conditions: ["test -f unreachable.txt"],
+		});
+
+		// A waiver without a reason is not a waiver.
+		await expect(harness.session.handleGoalHostRequest("goal.complete", { waive: { D1: "  " } })).rejects.toThrow(
+			/requires a non-empty reason/,
+		);
+		// Still blocked without one.
+		await expect(harness.session.handleGoalHostRequest("goal.complete")).rejects.toThrow(/not satisfied/);
+
+		await harness.session.handleGoalHostRequest("goal.complete", {
+			waive: { D1: "staging DNS is down, verified by hand" },
+		});
+
+		expect(harness.session.goalState.status).toBe("complete");
+		expect(harness.session.goalState.lastReason).toContain("WAIVED D1");
+		expect(harness.session.goalState.lastReason).toContain("staging DNS is down");
+	});
+
+	it("reports conditions left unrun by the total budget as red, never as passed", async () => {
+		const results = await evaluateGoalConditions(
+			[
+				{ id: "D1", command: "sleep 30", baselineExit: 1 },
+				{ id: "D2", command: "true", baselineExit: 1 },
+			],
+			{ cwd: tmpdir(), timeoutMs: 5_000, totalTimeoutMs: 120 },
+		);
+
+		expect(results[0]).toMatchObject({ passed: false });
+		// D2 would pass if run; an unrun check is not a pass.
+		expect(results[1]).toMatchObject({ passed: false, exitCode: 124 });
+		expect(results[1].output).toContain("budget");
 	});
 
 	it("treats a condition that cannot run as red rather than crashing", async () => {
@@ -98,7 +153,7 @@ describe("goal definition-of-done conditions", () => {
 		// An unknown binary still spawns `sh` (which exits 127); an unusable
 		// working directory is the other failure shape. Both must stay red —
 		// a check that cannot run is not a pass.
-		const results = await evaluateGoalConditions([{ id: "D1", command: "true" }], {
+		const results = await evaluateGoalConditions([{ id: "D1", command: "true", baselineExit: 1 }], {
 			cwd: join(tmpdir(), "goal-conditions-directory-that-does-not-exist"),
 		});
 
@@ -106,7 +161,7 @@ describe("goal definition-of-done conditions", () => {
 	});
 
 	it("fails a condition that hangs instead of waiting on it forever", async () => {
-		const results = await evaluateGoalConditions([{ id: "D1", command: "sleep 30" }], {
+		const results = await evaluateGoalConditions([{ id: "D1", command: "sleep 30", baselineExit: 1 }], {
 			cwd: tmpdir(),
 			timeoutMs: 150,
 		});

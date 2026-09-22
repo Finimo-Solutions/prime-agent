@@ -34,12 +34,14 @@ await goal.complete()
   Set `token_budget` only when an explicit token budget is requested.
   `conditions` is a list of shell commands, numbered `D1..Dn`, each satisfied
   when it exits 0 — the goal's machine-readable Definition of Done.
-- `await goal.complete()` — mark the existing goal achieved. Use only when the
-  objective has actually been achieved and no required work remains; do not
-  call it merely because the budget is nearly exhausted or because you are
-  stopping work. When the goal carries conditions, the host runs them and
-  RAISES with the failing ones listed instead of completing. When the result
-  includes a `completion_budget_report`, report that final usage to the user.
+- `await goal.complete(waive=None)` — mark the existing goal achieved. Use only
+  when the objective has actually been achieved and no required work remains;
+  do not call it merely because the budget is nearly exhausted or because you
+  are stopping work. When the goal carries conditions, the host runs them and
+  RAISES with the failing ones listed instead of completing. `waive` is
+  `{condition_id: reason}` for a condition red for a reason the work cannot fix;
+  the reason is mandatory and is recorded on the goal. When the result includes
+  a `completion_budget_report`, report that final usage to the user.
 
 ## Rules
 
@@ -54,3 +56,10 @@ await goal.complete()
   nothing, and is reported as non-discriminating when the goal completes.
 - A refused completion is not an error to work around. Do the work the failing
   condition describes, then call `await goal.complete()` again.
+- A Definition of Done in which EVERY condition already passes is refused at
+  creation — it cannot fail, so completing it would prove nothing. One
+  already-green condition is fine and often right: a regression guard ("the
+  suite still passes") is non-discriminating by construction.
+- Waive only what the work genuinely cannot fix, and say why. A waiver is
+  recorded on the completed goal; `/goal clear` is not an exemption, it
+  destroys the goal and the evidence that a gate existed.

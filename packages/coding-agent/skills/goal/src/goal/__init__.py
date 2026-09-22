@@ -56,7 +56,7 @@ async def create(
     return await host_request("goal.create", payload)
 
 
-async def complete() -> dict[str, Any]:
+async def complete(waive: dict[str, str] | None = None) -> dict[str, Any]:
     """Mark the existing thread goal achieved.
 
     Use only when the objective has actually been achieved and no required
@@ -66,5 +66,15 @@ async def complete() -> dict[str, Any]:
 
     When the goal carries conditions, the host runs them now and RAISES with
     the failing ones listed rather than completing; the goal stays active.
+
+    `waive` is `{condition_id: reason}` for a condition that is red for a
+    reason the work cannot fix (a dead dependency, a moved path). The reason is
+    mandatory and is recorded on the completed goal, so an excused check stays
+    visible as excused. Do not waive a condition you simply have not satisfied.
     """
-    return await host_request("goal.complete")
+    payload: dict[str, Any] = {}
+    if waive is not None:
+        if not isinstance(waive, dict):
+            raise TypeError(f"waive must be dict[str, str] or None, got {type(waive).__name__}")
+        payload["waive"] = waive
+    return await host_request("goal.complete", payload)
