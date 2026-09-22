@@ -149,7 +149,7 @@ function createFauxIpythonTool(sessionRef: { current?: AgentSession }) {
 				const spaceIndex = code.indexOf(" ");
 				const type = spaceIndex < 0 ? code : code.slice(0, spaceIndex);
 				const payload = spaceIndex < 0 ? {} : JSON.parse(code.slice(spaceIndex + 1));
-				text = JSON.stringify(session.handleGoalHostRequest(type, payload));
+				text = JSON.stringify(await session.handleGoalHostRequest(type, payload));
 			}
 			return { content: [{ type: "text" as const, text }], details: {} };
 		},
@@ -945,7 +945,7 @@ describe("AgentSession compaction", () => {
 		});
 		harnesses.push(harness);
 		sessionRef.current = harness.session;
-		harness.session.handleGoalHostRequest("goal.create", { objective: "finish the task" });
+		await harness.session.handleGoalHostRequest("goal.create", { objective: "finish the task" });
 		const internals = internalsOf(harness);
 
 		const shouldStop = await internals._shouldStopAfterTurn(midToolLoopContext(harness));
@@ -963,7 +963,7 @@ describe("AgentSession compaction", () => {
 		const harness = await createHarness({ ...thresholdOptions, tools: [createFauxIpythonTool(sessionRef)] });
 		harnesses.push(harness);
 		sessionRef.current = harness.session;
-		harness.session.handleGoalHostRequest("goal.create", { objective: "finish the task" });
+		await harness.session.handleGoalHostRequest("goal.create", { objective: "finish the task" });
 		const internals = internalsOf(harness);
 		const context = midToolLoopContext(harness);
 

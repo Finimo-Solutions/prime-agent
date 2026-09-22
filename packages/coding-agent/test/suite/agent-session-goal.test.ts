@@ -83,7 +83,7 @@ function createFauxIpythonTool(sessionRef: { current?: AgentSession }): AgentToo
 				const spaceIndex = code.indexOf(" ");
 				const type = spaceIndex < 0 ? code : code.slice(0, spaceIndex);
 				const payload = spaceIndex < 0 ? {} : JSON.parse(code.slice(spaceIndex + 1));
-				text = JSON.stringify(session.handleGoalHostRequest(type, payload));
+				text = JSON.stringify(await session.handleGoalHostRequest(type, payload));
 			}
 			return { content: [{ type: "text", text }], details: {} };
 		},
@@ -193,13 +193,13 @@ describe("AgentSession goals", () => {
 	it("returns goal snapshots over the host bridge and allows a fresh goal after completion", async () => {
 		const harness = await createGoalHarness();
 
-		expect(harness.session.handleGoalHostRequest("goal.get")).toEqual({
+		expect(await harness.session.handleGoalHostRequest("goal.get")).toEqual({
 			goal: null,
 			remaining_tokens: null,
 			completion_budget_report: null,
 		});
 
-		const created = harness.session.handleGoalHostRequest("goal.create", {
+		const created = await harness.session.handleGoalHostRequest("goal.create", {
 			objective: "write a benchmark note",
 			token_budget: 50,
 		});
@@ -211,11 +211,11 @@ describe("AgentSession goals", () => {
 		});
 		expect(created.remaining_tokens).toBe(50);
 
-		const completed = harness.session.handleGoalHostRequest("goal.complete");
+		const completed = await harness.session.handleGoalHostRequest("goal.complete");
 		expect(completed.goal).toMatchObject({ status: "complete" });
 		expect(completed.completion_budget_report).toContain("tokens used: 0 of 50");
 
-		const second = harness.session.handleGoalHostRequest("goal.create", { objective: "second goal" });
+		const second = await harness.session.handleGoalHostRequest("goal.create", { objective: "second goal" });
 		expect(second.goal).toMatchObject({ objective: "second goal", status: "active", tokens_used: 0 });
 		expect(second.goal?.goal_id).not.toBe(created.goal?.goal_id);
 		expect(harness.session.goalState).toMatchObject({
@@ -258,10 +258,10 @@ describe("AgentSession goals", () => {
 	])("rejects $name", async ({ type, payload, active, error }) => {
 		const harness = await createGoalHarness();
 		if (active) {
-			harness.session.handleGoalHostRequest("goal.create", { objective: "first goal" });
+			await harness.session.handleGoalHostRequest("goal.create", { objective: "first goal" });
 		}
 
-		expect(() => harness.session.handleGoalHostRequest(type, payload)).toThrow(error);
+		await expect(harness.session.handleGoalHostRequest(type, payload)).rejects.toThrow(error);
 	});
 
 	it("does not count post-completion turns against the finished goal", async () => {
@@ -295,7 +295,7 @@ describe("AgentSession goals", () => {
 	])("runtime rebuild restores tools $name", async ({ withGoal, expected }) => {
 		const harness = await createGoalHarness();
 		if (withGoal) {
-			harness.session.handleGoalHostRequest("goal.create", { objective: "finish the active goal" });
+			await harness.session.handleGoalHostRequest("goal.create", { objective: "finish the active goal" });
 		} else {
 			harness.session.setActiveToolsByName([]);
 		}
@@ -367,7 +367,7 @@ describe("AgentSession goals", () => {
 			status: "paused",
 			lastReason: "Paused by user",
 		});
-		expect(() => harness.session.handleGoalHostRequest("goal.create", { objective: "replacement" })).toThrow(
+		await expect(harness.session.handleGoalHostRequest("goal.create", { objective: "replacement" })).rejects.toThrow(
 			"a paused goal exists; ask the user to resume it with /goal resume or clear it with /goal clear",
 		);
 
@@ -657,7 +657,7 @@ describe("initial goal seeding from config", () => {
 			name: "completed",
 			objective: "Complete me",
 			prepare: async (harness: Harness) => {
-				harness.session.handleGoalHostRequest("goal.complete");
+				await harness.session.handleGoalHostRequest("goal.complete");
 			},
 			expected: { status: "complete", objective: "Complete me" },
 		},
