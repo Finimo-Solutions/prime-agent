@@ -157,6 +157,7 @@ import { captureGoalConditionBaseline, evaluateGoalConditions } from "./goal-con
 import {
 	createGoalContextMessage,
 	emptyGoalState,
+	formatGoalCompletionReason,
 	formatGoalConditionRefusal,
 	GOAL_CONTEXT_CUSTOM_TYPE,
 	GOAL_CONTEXT_PREVIEW_LABEL,
@@ -171,9 +172,11 @@ import {
 	goalTokenDeltaForUsage,
 	isPersistedGoalState,
 	normalizeGoalState,
+	vacuousDefinitionOfDone,
 	validateGoalBudget,
 	validateGoalConditions,
 	validateGoalObjective,
+	validateGoalWaivers,
 } from "./goals.js";
 import type { HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
 import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
@@ -3694,7 +3697,7 @@ export class AgentSession {
 				return goalHostResponse(created, false);
 			}
 			case "goal.complete":
-				return goalHostResponse(await this._completeGoalFromHost(), true);
+				return goalHostResponse(await this._completeGoalFromHost(payload.waive), true);
 			default:
 				throw new Error(`unknown goal request type "${type}"`);
 		}
@@ -3997,34 +4000,39 @@ export class AgentSession {
 		}
 		// idle, or a terminal record (complete / error): nothing pending, start fresh.
 		const validated = validateGoalConditions(conditions);
-		const started = this._startGoal(objective, tokenBudget, validated);
 		if (!validated) {
-			return started;
+			return this._startGoal(objective, tokenBudget);
 		}
-		// Record how each condition behaves before any work happens, so a
-		// condition that was already green can be named as proving nothing.
+		// Baseline BEFORE the goal is written, not after. Writing the goal first
+		// and baselining into it leaves a window in which stored conditions have
+		// no baseline, and the vacuity check reads a missing baseline as "this
+		// condition discriminates" — a silent clean pass. One write, or none.
 		const baselined = await captureGoalConditionBaseline(validated, { cwd: this._cwd });
-		this._setGoalState({ ...this._goalState, conditions: baselined });
-		return this._goalState;
+		const vacuous = vacuousDefinitionOfDone(baselined);
+		if (vacuous) {
+			throw new Error(vacuous);
+		}
+		return this._startGoal(objective, tokenBudget, baselined);
 	}
 
-	private async _completeGoalFromHost(): Promise<GoalState> {
+	private async _completeGoalFromHost(waive: unknown): Promise<GoalState> {
 		if (!this._goalState.objective || this._goalState.status === "idle") {
 			throw new Error("cannot complete goal because this thread has no goal");
 		}
 		const conditions = this._goalState.conditions;
+		const waivers = validateGoalWaivers(waive);
 		let reason = "Goal achieved";
 		if (conditions?.length) {
 			// The objective is prose the host cannot check; these are the
 			// checkable half. Refuse rather than record an unverified claim.
 			const results = await evaluateGoalConditions(conditions, { cwd: this._cwd });
-			if (results.some((result) => !result.passed)) {
-				throw new Error(formatGoalConditionRefusal(results));
+			const blocking = results.filter((result) => !result.passed && !waivers?.has(result.id));
+			if (blocking.length) {
+				throw new Error(formatGoalConditionRefusal(results, waivers));
 			}
-			const vacuous = results.filter((result) => result.nonDiscriminating);
-			reason = vacuous.length
-				? `Goal achieved (${results.length} conditions passed; ${vacuous.map((result) => result.id).join(", ")} also passed before the work started and prove nothing)`
-				: `Goal achieved (${results.length} conditions passed)`;
+			reason = formatGoalCompletionReason(results, waivers);
+		} else if (waivers?.size) {
+			throw new Error("cannot waive conditions because this goal has none");
 		}
 		const goal = this._goalWithAccountedWallClock();
 		// A turn can cross the budget and complete the goal at once: accounting
