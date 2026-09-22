@@ -153,13 +153,16 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.js";
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
+import { captureGoalConditionBaseline, evaluateGoalConditions } from "./goal-conditions.js";
 import {
 	createGoalContextMessage,
 	emptyGoalState,
+	formatGoalConditionRefusal,
 	GOAL_CONTEXT_CUSTOM_TYPE,
 	GOAL_CONTEXT_PREVIEW_LABEL,
 	GOAL_SKILL_NAME,
 	GOAL_STATE_CUSTOM_TYPE,
+	type GoalCondition,
 	type GoalContextDetails,
 	type GoalHostResponse,
 	type GoalState,
@@ -169,6 +172,7 @@ import {
 	isPersistedGoalState,
 	normalizeGoalState,
 	validateGoalBudget,
+	validateGoalConditions,
 	validateGoalObjective,
 } from "./goals.js";
 import type { HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
@@ -2231,7 +2235,7 @@ export class AgentSession {
 		this._emitQueueUpdate();
 	}
 
-	private _startGoal(objectiveText: string, tokenBudget: number | undefined): GoalState {
+	private _startGoal(objectiveText: string, tokenBudget: number | undefined, conditions?: GoalCondition[]): GoalState {
 		const objective = validateGoalObjective(objectiveText);
 		const budget = validateGoalBudget(tokenBudget);
 		const now = Date.now();
@@ -2246,6 +2250,7 @@ export class AgentSession {
 			continuationsUsed: 0,
 			createdAt: now,
 			updatedAt: now,
+			conditions,
 		};
 		this._goalAccountingStartedAt = now;
 		this._goalContinuationAwaitsRlmWork = false;
@@ -3671,7 +3676,7 @@ export class AgentSession {
 	 * goal skill). All goal state stays host-side; the kernel only sees the
 	 * serialized snake_case response.
 	 */
-	handleGoalHostRequest(type: string, payload: Record<string, unknown> = {}): GoalHostResponse {
+	async handleGoalHostRequest(type: string, payload: Record<string, unknown> = {}): Promise<GoalHostResponse> {
 		if (!this._includeGoals) {
 			throw new Error("goals are disabled in this session");
 		}
@@ -3685,10 +3690,11 @@ export class AgentSession {
 				if (payload.token_budget !== undefined && typeof payload.token_budget !== "number") {
 					throw new Error("goal.create token_budget must be an integer when provided");
 				}
-				return goalHostResponse(this._createGoalFromHost(payload.objective, payload.token_budget), false);
+				const created = await this._createGoalFromHost(payload.objective, payload.token_budget, payload.conditions);
+				return goalHostResponse(created, false);
 			}
 			case "goal.complete":
-				return goalHostResponse(this._completeGoalFromHost(), true);
+				return goalHostResponse(await this._completeGoalFromHost(), true);
 			default:
 				throw new Error(`unknown goal request type "${type}"`);
 		}
@@ -3968,7 +3974,11 @@ export class AgentSession {
 		}
 	}
 
-	private _createGoalFromHost(objective: string, tokenBudget: number | undefined): GoalState {
+	private async _createGoalFromHost(
+		objective: string,
+		tokenBudget: number | undefined,
+		conditions: unknown,
+	): Promise<GoalState> {
 		switch (this._goalState.status) {
 			case "active":
 				throw new Error(
@@ -3983,14 +3993,38 @@ export class AgentSession {
 					"cannot create a new goal because a budget-limited goal exists; ask the user to resume it with /goal resume or clear it with /goal clear",
 				);
 			default:
-				// idle, or a terminal record (complete / error): nothing pending, start fresh.
-				return this._startGoal(objective, tokenBudget);
+				break;
 		}
+		// idle, or a terminal record (complete / error): nothing pending, start fresh.
+		const validated = validateGoalConditions(conditions);
+		const started = this._startGoal(objective, tokenBudget, validated);
+		if (!validated) {
+			return started;
+		}
+		// Record how each condition behaves before any work happens, so a
+		// condition that was already green can be named as proving nothing.
+		const baselined = await captureGoalConditionBaseline(validated, { cwd: this._cwd });
+		this._setGoalState({ ...this._goalState, conditions: baselined });
+		return this._goalState;
 	}
 
-	private _completeGoalFromHost(): GoalState {
+	private async _completeGoalFromHost(): Promise<GoalState> {
 		if (!this._goalState.objective || this._goalState.status === "idle") {
 			throw new Error("cannot complete goal because this thread has no goal");
+		}
+		const conditions = this._goalState.conditions;
+		let reason = "Goal achieved";
+		if (conditions?.length) {
+			// The objective is prose the host cannot check; these are the
+			// checkable half. Refuse rather than record an unverified claim.
+			const results = await evaluateGoalConditions(conditions, { cwd: this._cwd });
+			if (results.some((result) => !result.passed)) {
+				throw new Error(formatGoalConditionRefusal(results));
+			}
+			const vacuous = results.filter((result) => result.nonDiscriminating);
+			reason = vacuous.length
+				? `Goal achieved (${results.length} conditions passed; ${vacuous.map((result) => result.id).join(", ")} also passed before the work started and prove nothing)`
+				: `Goal achieved (${results.length} conditions passed)`;
 		}
 		const goal = this._goalWithAccountedWallClock();
 		// A turn can cross the budget and complete the goal at once: accounting
@@ -4001,7 +4035,7 @@ export class AgentSession {
 			...goal,
 			active: false,
 			status: "complete",
-			lastReason: "Goal achieved",
+			lastReason: reason,
 			lastError: undefined,
 		});
 		return this._goalState;

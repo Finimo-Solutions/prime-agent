@@ -6,6 +6,32 @@ export const GOAL_CONTEXT_CUSTOM_TYPE = "goal_context";
 export const GOAL_CONTEXT_PREVIEW_LABEL = "Goal context";
 export const GOAL_SKILL_NAME = "goal";
 export const MAX_THREAD_GOAL_OBJECTIVE_CHARS = 4000;
+export const MAX_GOAL_CONDITIONS = 20;
+export const MAX_GOAL_CONDITION_CHARS = 2000;
+/** Per-condition wall-clock ceiling. A condition that hangs is a failed condition. */
+export const GOAL_CONDITION_TIMEOUT_MS = 120_000;
+
+/**
+ * One machine-readable Definition-of-Done condition. `command` runs under
+ * `sh -c`; exit 0 means satisfied. `baselineExit` is the exit code recorded
+ * when the goal was created: a condition that already passed then cannot
+ * discriminate, so it proves nothing about the work that followed.
+ */
+export interface GoalCondition {
+	id: string;
+	command: string;
+	baselineExit?: number;
+}
+
+export interface GoalConditionResult {
+	id: string;
+	command: string;
+	passed: boolean;
+	exitCode: number;
+	/** Passed before any work started, so a pass now is not evidence. */
+	nonDiscriminating: boolean;
+	output?: string;
+}
 
 export type GoalStatus = "idle" | "active" | "paused" | "budget_limited" | "complete" | "error";
 export type GoalContextKind = "continuation" | "budget_limit" | "objective_updated";
@@ -29,6 +55,7 @@ export interface GoalState {
 	updatedAt?: number;
 	lastReason?: string;
 	lastError?: string;
+	conditions?: GoalCondition[];
 }
 
 /** Goal payload returned to the kernel-side goal skill. Keys are Python-conventional snake_case. */
@@ -41,6 +68,7 @@ export type SerializedGoal = {
 	time_used_seconds: number;
 	created_at?: number;
 	updated_at?: number;
+	conditions?: { id: string; command: string; baseline_exit?: number }[];
 };
 
 /** Reply payload for goal.* host requests from the Python kernel. */
@@ -99,6 +127,54 @@ export function validateGoalBudget(value: number | undefined): number | undefine
 	return value;
 }
 
+/**
+ * Accept a list of shell commands and number them D1..Dn, matching the fleet's
+ * work-order convention. Returns undefined when no conditions are supplied —
+ * conditions are optional, so existing goals keep working unchanged.
+ */
+export function validateGoalConditions(value: unknown): GoalCondition[] | undefined {
+	if (value === undefined || value === null) {
+		return undefined;
+	}
+	if (!Array.isArray(value)) {
+		throw new Error("Goal conditions must be a list of shell command strings.");
+	}
+	if (value.length === 0) {
+		return undefined;
+	}
+	if (value.length > MAX_GOAL_CONDITIONS) {
+		throw new Error(`Goal accepts at most ${MAX_GOAL_CONDITIONS} conditions.`);
+	}
+	return value.map((entry, index) => {
+		if (typeof entry !== "string") {
+			throw new Error("Each goal condition must be a shell command string.");
+		}
+		const command = entry.trim();
+		if (!command) {
+			throw new Error("Goal conditions must not be empty.");
+		}
+		if ([...command].length > MAX_GOAL_CONDITION_CHARS) {
+			throw new Error(`Each goal condition must be at most ${MAX_GOAL_CONDITION_CHARS} characters.`);
+		}
+		return { id: `D${index + 1}`, command };
+	});
+}
+
+/** The refusal text shown to the model when completion is blocked. */
+export function formatGoalConditionRefusal(results: GoalConditionResult[]): string {
+	const failed = results.filter((result) => !result.passed);
+	const lines = failed.map((result) => {
+		const detail = result.output?.trim();
+		const suffix = detail ? ` — ${detail.split("\n").slice(-1)[0]?.slice(0, 200)}` : "";
+		return `  ${result.id} (exit ${result.exitCode}) ${result.command}${suffix}`;
+	});
+	return [
+		`cannot complete goal: ${failed.length} of ${results.length} conditions are not satisfied.`,
+		...lines,
+		"The goal stays active. Do the work these conditions describe, then call `await goal.complete()` again.",
+	].join("\n");
+}
+
 export function goalTokenDeltaForUsage(usage: { input: number; output: number }): number {
 	return Math.max(0, usage.input) + Math.max(0, usage.output);
 }
@@ -147,6 +223,11 @@ export function goalHostResponse(goal: GoalState, includeCompletionReport: boole
 		time_used_seconds: goal.timeUsedSeconds,
 		created_at: goal.createdAt,
 		updated_at: goal.updatedAt,
+		conditions: goal.conditions?.map((condition) => ({
+			id: condition.id,
+			command: condition.command,
+			baseline_exit: condition.baselineExit,
+		})),
 	};
 
 	return {
